@@ -34,6 +34,15 @@ pip install -r requirements.txt
 python setup.py develop
 ```
 
+install flash attn
+```
+pip install flash-attn --no-build-isolation
+```
+
+install apex
+```
+
+```
 
 ## Quick Start
 ### Download checkpoints
@@ -65,7 +74,7 @@ python inference_streaming.py \
 MY OWN COMMAND LINE
 ```
 python inference.py \
-    --config_path configs/inference_yaml/configs/inference_yaml/temple_run.yaml \
+    --config_path configs/inference_yaml/temple_run.yaml \
     --checkpoint_path models/templerun_distilled_models/templerun_7dim_onlykey.safetensors \
     --img_path demo_images/temple_run \
     --output_folder outputs \
