@@ -62,6 +62,17 @@ python inference_streaming.py \
     --seed 42 \
     --pretrained_model_path {path-to-the-vae-folder}
 ```
+MY OWN COMMAND LINE
+```
+python inference.py \
+    --config_path configs/inference_yaml/configs/inference_yaml/temple_run.yaml \
+    --checkpoint_path models/templerun_distilled_models/templerun_7dim_onlykey.safetensors \
+    --img_path demo_images/temple_run \
+    --output_folder outputs \
+    --num_output_frames 150 \
+    --seed 42 \
+    --pretrained_model_path models/Wan2.1_VAE.pth
+```
 
 ### Tips
 - In the current version, upward movement for camera may cause brief rendering glitches (e.g., black screens). A fix is planned for future updates. Adjust movement slightly or change direction to resolve it.
