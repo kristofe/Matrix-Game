@@ -74,13 +74,13 @@ python inference_streaming.py \
 MY OWN COMMAND LINE
 ```
 python inference.py \
-    --config_path configs/inference_yaml/temple_run.yaml \
-    --checkpoint_path models/templerun_distilled_models/templerun_7dim_onlykey.safetensors \
+    --config_path configs/inference_yaml/inference_templerun.yaml \
+    --checkpoint_path models/templerun_distilled_model/templerun_7dim_onlykey.safetensors \
     --img_path demo_images/temple_run \
     --output_folder outputs \
     --num_output_frames 150 \
     --seed 42 \
-    --pretrained_model_path models/Wan2.1_VAE.pth
+    --pretrained_model_path models/
 ```
 
 ### Tips
