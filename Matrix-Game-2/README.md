@@ -76,7 +76,7 @@ MY OWN COMMAND LINE
 python inference.py \
     --config_path configs/inference_yaml/inference_templerun.yaml \
     --checkpoint_path models/templerun_distilled_model/templerun_7dim_onlykey.safetensors \
-    --img_path demo_images/temple_run \
+    --img_path demo_images/temple_run/0000.png \
     --output_folder outputs \
     --num_output_frames 150 \
     --seed 42 \
