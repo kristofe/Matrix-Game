@@ -1,17 +1,26 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
-from flash_attn import flash_attn_func
 import torch
 import torch.nn as nn
 from .posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
 import math
 from torch.nn.attention.flex_attention import flex_attention
 
+# Handle flash_attn import gracefully
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    print("Warning: flash_attn not available, using fallback attention")
+    FLASH_ATTN_AVAILABLE = False
+    def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), alibi_slopes=None, deterministic=False, return_attn_probs=False):
+        # Fallback to standard attention
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal)
+
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
 except:
-    from flash_attn import flash_attn_func
     FLASH_ATTN_3_AVAILABLE = False
 
 
@@ -172,6 +181,19 @@ class ActionModule(nn.Module):
             )
             rope_sizes = [
                 s // self.patch_size[idx] for idx, s in enumerate(latents_size)
+            ]
+        else:
+            # Handle tuple or other types by converting to list
+            patch_size_list = list(self.patch_size) if hasattr(self.patch_size, '__iter__') else [self.patch_size]
+            assert all(
+                s % patch_size_list[idx] == 0
+                for idx, s in enumerate(latents_size)
+            ), (
+                f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.patch_size}), "
+                f"but got {latents_size}."
+            )
+            rope_sizes = [
+                s // patch_size_list[idx] for idx, s in enumerate(latents_size)
             ]
 
         if len(rope_sizes) != target_ndim:

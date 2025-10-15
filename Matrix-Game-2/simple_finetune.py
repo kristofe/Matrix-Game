@@ -30,16 +30,16 @@ class SimpleDataset(Dataset):
         self.mouse_actions = []
         
         for _ in range(num_samples):
-            # Random video frames (B, T, H, W, C)
-            frames = torch.randn(1, num_frames, 352, 640, 3)
+            # Random video frames (T, H, W, C) - no batch dimension in dataset
+            frames = torch.randn(num_frames, 352, 640, 3)
             self.video_frames.append(frames)
             
-            # Random keyboard actions (B, T, 4) for universal mode
-            keyboard = torch.randint(0, 2, (1, num_frames, 4)).float()
+            # Random keyboard actions (T, 4) for universal mode
+            keyboard = torch.randint(0, 2, (num_frames, 4)).float()
             self.keyboard_actions.append(keyboard)
             
-            # Random mouse actions (B, T, 2)
-            mouse = torch.randn(1, num_frames, 2) * 0.1
+            # Random mouse actions (T, 2)
+            mouse = torch.randn(num_frames, 2) * 0.1
             self.mouse_actions.append(mouse)
     
     def __len__(self):
@@ -97,7 +97,7 @@ def simple_finetune():
     print("Loading model...")
     model = CausalWanModel(
         model_type='i2v',
-        patch_size=tuple(config.patch_size),
+        patch_size=tuple(config.action_config.patch_size),
         dim=config.dim,
         ffn_dim=config.ffn_dim,
         num_heads=config.num_heads,
@@ -159,14 +159,14 @@ def simple_finetune():
             video_tensor = video_tensor.reshape(batch_size * channels, num_frames, height, width)
             
             # Create dummy latents (in real training, you'd use VAE)
+            # The model expects 36 input channels total, so we need to adjust our latents
             latents = torch.randn(batch_size, 16, num_frames, 44, 80, device=device, dtype=torch.bfloat16)
             
             # Prepare conditioning
-            conditional_dict = {
-                'keyboard_cond': keyboard_actions,
-                'mouse_cond': mouse_actions,
-                'visual_context': torch.randn(batch_size, 512, device=device, dtype=torch.bfloat16)
-            }
+            visual_context = torch.randn(batch_size, 1280, device=device, dtype=torch.bfloat16)
+            # cond_concat should be concatenated with latents to make 36 total channels
+            # So we need 36 - 16 = 20 channels for cond_concat
+            cond_concat = torch.zeros(batch_size, 20, num_frames, 44, 80, device=device, dtype=torch.bfloat16)
             
             # Add noise for diffusion training
             noise = torch.randn_like(latents)
@@ -175,14 +175,21 @@ def simple_finetune():
             # Simple noise schedule
             sqrt_alpha_prod = (1 - timesteps / 1000.0) ** 0.5
             sqrt_one_minus_alpha_prod = (timesteps / 1000.0) ** 0.5
-            sqrt_alpha_prod = sqrt_alpha_prod.view(-1, 1, 1, 1, 1)
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view(-1, 1, 1, 1, 1)
+            sqrt_alpha_prod = sqrt_alpha_prod.view(-1, 1, 1, 1, 1).to(dtype=torch.bfloat16)
+            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view(-1, 1, 1, 1, 1).to(dtype=torch.bfloat16)
             
             noisy_latents = sqrt_alpha_prod * latents + sqrt_one_minus_alpha_prod * noise
             
             # Forward pass
             try:
-                predicted_noise = model(noisy_latents, timesteps, conditional_dict=conditional_dict)
+                predicted_noise = model(
+                    noisy_latents, 
+                    timesteps, 
+                    visual_context=visual_context,
+                    cond_concat=cond_concat,
+                    mouse_cond=mouse_actions,
+                    keyboard_cond=keyboard_actions
+                )
                 loss = nn.functional.mse_loss(predicted_noise, noise)
                 
                 # Backward pass

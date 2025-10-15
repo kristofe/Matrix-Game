@@ -82,6 +82,9 @@ python inference.py \
     --seed 42 \
     --pretrained_model_path models/
 ```
+```
+python inference.py     --config_path configs/inference_yaml/inference_universal.yaml     --checkpoint_path models/base_distilled_model/base_distill.safetensors     --img_path demo_images/universal/0000.png     --output_folder outputs     --num_output_frames 150     --seed 42     --pretrained_model_path models/
+```
 
 ### Tips
 - In the current version, upward movement for camera may cause brief rendering glitches (e.g., black screens). A fix is planned for future updates. Adjust movement slightly or change direction to resolve it.
