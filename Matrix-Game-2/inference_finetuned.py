@@ -236,7 +236,9 @@ class FinetunedModelInference:
             print(f"Latents shape for decoder: {latents_for_decode.shape}")
             
             # Decode using VAE decoder - it returns (decoded_video, feat_cache)
-            decoded_video, _ = self.vae_decoder(latents_for_decode)
+            # The decoder expects feat_cache as *args, pass empty tensors for initial cache
+            # Based on vae_block3.py, we need to pass cache tensors as separate arguments
+            decoded_video, _ = self.vae_decoder(latents_for_decode, *[None] * 32)
             
             # decoded_video is [B, T, C, H, W], convert to [B, T, H, W, C]
             videos = rearrange(decoded_video, "B T C H W -> B T H W C")
