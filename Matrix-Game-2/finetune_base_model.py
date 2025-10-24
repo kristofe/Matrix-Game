@@ -252,7 +252,7 @@ def finetune_base_model():
     # 13 frames -> 4 latent frames
     # 25 frames -> 7 latent frames
     SEQUENCE_LENGTH = 9  # Must give exactly 3 latent frames for num_frame_per_block=3
-    BATCH_SIZE = 1  # Batch size for training (now supports batching!)
+    BATCH_SIZE = 8  # Batch size for training (now supports batching!)
     NUM_EPOCHS = 10
     LEARNING_RATE = 1e-5  # Lower learning rate for fine-tuning
     TRAINING_STRATEGY = 'action_only'  # 'action_only' or 'last_layers' or 'full'
