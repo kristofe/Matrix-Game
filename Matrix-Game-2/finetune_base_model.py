@@ -252,7 +252,7 @@ def finetune_base_model():
     # 13 frames -> 4 latent frames
     # 25 frames -> 7 latent frames
     SEQUENCE_LENGTH = 9  # Must give exactly 3 latent frames for num_frame_per_block=3
-    BATCH_SIZE = 8  # Batch size for training (now supports batching!)
+    BATCH_SIZE = 1  # Batch size for training (now supports batching!)
     NUM_EPOCHS = 10
     LEARNING_RATE = 1e-5  # Lower learning rate for fine-tuning
     TRAINING_STRATEGY = 'action_only'  # 'action_only' or 'last_layers' or 'full'
@@ -272,6 +272,11 @@ def finetune_base_model():
     
     # Configure training strategy
     model = configure_training_strategy(model, TRAINING_STRATEGY)
+    
+    # Ensure all trainable parameters are in bfloat16
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.bfloat16)
     
     # Create dataset
     print(f"\nLoading dataset from: {DATA_DIR}")
@@ -295,6 +300,9 @@ def finetune_base_model():
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS * len(dataloader))
+    
+    # GradScaler for mixed precision training with bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=False)  # bfloat16 doesn't need scaling
     
     # Create checkpoint directory
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -363,54 +371,58 @@ def finetune_base_model():
                 noise = torch.randn_like(latents)
                 
                 # Sample timesteps (uniform sampling from [0, 1000])
-                timesteps = torch.randint(0, 1000, (batch_size,), device=device, dtype=torch.float32)
+                # Use bfloat16 to match model dtype
+                timesteps = torch.randint(0, 1000, (batch_size,), device=device).float().to(dtype=torch.bfloat16)
                 
                 # Simple noise schedule (linear)
                 sqrt_alpha_prod = (1 - timesteps / 1000.0) ** 0.5
                 sqrt_one_minus_alpha_prod = (timesteps / 1000.0) ** 0.5
-                sqrt_alpha_prod = sqrt_alpha_prod.view(-1, 1, 1, 1, 1).to(dtype=torch.bfloat16)
-                sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view(-1, 1, 1, 1, 1).to(dtype=torch.bfloat16)
+                sqrt_alpha_prod = sqrt_alpha_prod.view(-1, 1, 1, 1, 1)
+                sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view(-1, 1, 1, 1, 1)
                 
                 # Add noise to latents
                 noisy_latents = sqrt_alpha_prod * latents + sqrt_one_minus_alpha_prod * noise
                 
-                # Forward pass through the model
+                # Forward pass through the model with autocast for mixed precision
                 # Note: Action module requires batch_size=1, so we process each sample separately
-                if batch_size > 1:
-                    predicted_noise_list = []
-                    for i in range(batch_size):
-                        pred = model(
-                            noisy_latents[i:i+1],
-                            timesteps[i:i+1],
-                            visual_context=visual_context[i:i+1],
-                            cond_concat=cond_concat[i:i+1],
-                            mouse_cond=mouse_actions[i:i+1],
-                            keyboard_cond=keyboard_actions[i:i+1]
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    if batch_size > 1:
+                        predicted_noise_list = []
+                        for i in range(batch_size):
+                            pred = model(
+                                noisy_latents[i:i+1],
+                                timesteps[i:i+1],
+                                visual_context=visual_context[i:i+1],
+                                cond_concat=cond_concat[i:i+1],
+                                mouse_cond=mouse_actions[i:i+1],
+                                keyboard_cond=keyboard_actions[i:i+1]
+                            )
+                            predicted_noise_list.append(pred)
+                        predicted_noise = torch.cat(predicted_noise_list, dim=0)
+                    else:
+                        predicted_noise = model(
+                            noisy_latents,
+                            timesteps,
+                            visual_context=visual_context,
+                            cond_concat=cond_concat,
+                            mouse_cond=mouse_actions,
+                            keyboard_cond=keyboard_actions
                         )
-                        predicted_noise_list.append(pred)
-                    predicted_noise = torch.cat(predicted_noise_list, dim=0)
-                else:
-                    predicted_noise = model(
-                        noisy_latents,
-                        timesteps,
-                        visual_context=visual_context,
-                        cond_concat=cond_concat,
-                        mouse_cond=mouse_actions,
-                        keyboard_cond=keyboard_actions
-                    )
-                
-                # Calculate loss (MSE between predicted and actual noise)
-                loss = nn.functional.mse_loss(predicted_noise, noise)
+                    
+                    # Calculate loss (MSE between predicted and actual noise)
+                    loss = nn.functional.mse_loss(predicted_noise, noise)
                 
                 # Backward pass
                 optimizer.zero_grad()
-                loss.backward()
+                scaler.scale(loss).backward()
                 
-                # Gradient clipping
+                # Gradient clipping (unscale before clipping)
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
                 
                 # Optimizer step
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 
                 # Update metrics
