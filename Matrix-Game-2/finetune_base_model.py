@@ -120,6 +120,68 @@ def setup_model(config_path, weights_path, device):
     
     return model, config
 
+def custom_collate_fn(batch):
+    """
+    Custom collate function to ensure all images in batch have same dimensions.
+    Pads or crops images to a consistent size if needed.
+    """
+    if len(batch) == 0:
+        return {}
+    
+    # Get the target size from the first item
+    target_shape = batch[0]['video_frames'].shape
+    
+    # Check if all items have the same shape
+    all_same = all(item['video_frames'].shape == target_shape for item in batch)
+    
+    if all_same:
+        # Simple case: stack everything
+        return {
+            'video_frames': torch.stack([item['video_frames'] for item in batch]),
+            'keyboard_actions': torch.stack([item['keyboard_actions'] for item in batch]),
+            'mouse_actions': torch.stack([item['mouse_actions'] for item in batch])
+        }
+    else:
+        # Need to resize/pad to consistent dimensions
+        # Find the most common shape or use the first one
+        collated_batch = {
+            'video_frames': [],
+            'keyboard_actions': [],
+            'mouse_actions': []
+        }
+        
+        for item in batch:
+            frames = item['video_frames']
+            # If shape doesn't match, resize to target
+            if frames.shape != target_shape:
+                # Interpolate to target size
+                # frames shape: (T, H, W, C)
+                T, H, W, C = frames.shape
+                target_T, target_H, target_W, target_C = target_shape
+                
+                # Resize each frame
+                resized_frames = []
+                for t in range(T):
+                    frame = frames[t]  # (H, W, C)
+                    # Convert to (C, H, W) for interpolate
+                    frame = frame.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+                    frame = torch.nn.functional.interpolate(
+                        frame, size=(target_H, target_W), mode='bilinear', align_corners=False
+                    )
+                    frame = frame.squeeze(0).permute(1, 2, 0)  # (H, W, C)
+                    resized_frames.append(frame)
+                frames = torch.stack(resized_frames)
+            
+            collated_batch['video_frames'].append(frames)
+            collated_batch['keyboard_actions'].append(item['keyboard_actions'])
+            collated_batch['mouse_actions'].append(item['mouse_actions'])
+        
+        return {
+            'video_frames': torch.stack(collated_batch['video_frames']),
+            'keyboard_actions': torch.stack(collated_batch['keyboard_actions']),
+            'mouse_actions': torch.stack(collated_batch['mouse_actions'])
+        }
+
 def configure_training_strategy(model, strategy='action_only'):
     """
     Configure which parameters to train based on the strategy.
@@ -190,10 +252,10 @@ def finetune_base_model():
     # 13 frames -> 4 latent frames
     # 25 frames -> 7 latent frames
     SEQUENCE_LENGTH = 9  # Must give exactly 3 latent frames for num_frame_per_block=3
-    BATCH_SIZE = 1  # Start with 1, increase if you have enough VRAM
+    BATCH_SIZE = 8  # Batch size for training (now supports batching!)
     NUM_EPOCHS = 10
     LEARNING_RATE = 1e-5  # Lower learning rate for fine-tuning
-    TRAINING_STRATEGY = 'action_only'  # or 'last_layers' or 'full'
+    TRAINING_STRATEGY = 'action_only'  # 'action_only' or 'last_layers' or 'full'
     
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -215,7 +277,14 @@ def finetune_base_model():
     print(f"\nLoading dataset from: {DATA_DIR}")
     print(f"Sequence length: {SEQUENCE_LENGTH} frames")
     dataset = UnrealDataset(data_dir=DATA_DIR, sequence_length=SEQUENCE_LENGTH)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=0, 
+        pin_memory=True,
+        collate_fn=custom_collate_fn  # Use custom collate to handle dimension mismatches
+    )
     
     print(f"Dataset size: {len(dataset)} sequences")
     print(f"Batches per epoch: {len(dataloader)}")
@@ -306,14 +375,29 @@ def finetune_base_model():
                 noisy_latents = sqrt_alpha_prod * latents + sqrt_one_minus_alpha_prod * noise
                 
                 # Forward pass through the model
-                predicted_noise = model(
-                    noisy_latents,
-                    timesteps,
-                    visual_context=visual_context,
-                    cond_concat=cond_concat,
-                    mouse_cond=mouse_actions,
-                    keyboard_cond=keyboard_actions
-                )
+                # Note: Action module requires batch_size=1, so we process each sample separately
+                if batch_size > 1:
+                    predicted_noise_list = []
+                    for i in range(batch_size):
+                        pred = model(
+                            noisy_latents[i:i+1],
+                            timesteps[i:i+1],
+                            visual_context=visual_context[i:i+1],
+                            cond_concat=cond_concat[i:i+1],
+                            mouse_cond=mouse_actions[i:i+1],
+                            keyboard_cond=keyboard_actions[i:i+1]
+                        )
+                        predicted_noise_list.append(pred)
+                    predicted_noise = torch.cat(predicted_noise_list, dim=0)
+                else:
+                    predicted_noise = model(
+                        noisy_latents,
+                        timesteps,
+                        visual_context=visual_context,
+                        cond_concat=cond_concat,
+                        mouse_cond=mouse_actions,
+                        keyboard_cond=keyboard_actions
+                    )
                 
                 # Calculate loss (MSE between predicted and actual noise)
                 loss = nn.functional.mse_loss(predicted_noise, noise)
