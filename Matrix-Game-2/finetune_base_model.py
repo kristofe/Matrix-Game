@@ -18,6 +18,8 @@ from tqdm import tqdm
 # Import Matrix-Game components
 from wan.modules.model import WanModel
 from convert_unreal_data import UnrealDataset
+from utils.scheduler import FlowMatchScheduler
+from einops import rearrange
 
 def sinusoidal_embedding_1d(freq_dim, t):
     """Create sinusoidal embeddings for time steps."""
@@ -299,7 +301,15 @@ def finetune_base_model():
     optimizer = optim.AdamW(trainable_params, lr=LEARNING_RATE, weight_decay=0.01)
     
     # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS * len(dataloader))
+    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS * len(dataloader))
+    
+    # Diffusion scheduler (for noise schedule during training)
+    diffusion_scheduler = FlowMatchScheduler(
+        shift=5.0,  # Match the base model
+        sigma_min=0.0,
+        extra_one_step=True
+    )
+    diffusion_scheduler.set_timesteps(1000, training=True)
     
     # GradScaler for mixed precision training with bfloat16
     scaler = torch.cuda.amp.GradScaler(enabled=False)  # bfloat16 doesn't need scaling
@@ -367,21 +377,21 @@ def finetune_base_model():
                 cond_concat = torch.zeros(batch_size, 20, latent_frames, latent_height, latent_width, 
                                         device=device, dtype=torch.bfloat16)
                 
-                # Diffusion training: add noise to latents
+                # Diffusion training: add noise to latents using FlowMatchScheduler
                 noise = torch.randn_like(latents)
                 
-                # Sample timesteps (uniform sampling from [0, 1000])
-                # Use bfloat16 to match model dtype
-                timesteps = torch.randint(0, 1000, (batch_size,), device=device).float().to(dtype=torch.bfloat16)
+                # Sample timesteps from scheduler (indices on CPU for indexing)
+                timestep_indices = torch.randint(0, 1000, (batch_size,), device='cpu')
+                timesteps = diffusion_scheduler.timesteps[timestep_indices].to(device=device, dtype=torch.bfloat16)
+                timestep_indices = timestep_indices.to(device)  # Move back to device for scheduler
                 
-                # Simple noise schedule (linear)
-                sqrt_alpha_prod = (1 - timesteps / 1000.0) ** 0.5
-                sqrt_one_minus_alpha_prod = (timesteps / 1000.0) ** 0.5
-                sqrt_alpha_prod = sqrt_alpha_prod.view(-1, 1, 1, 1, 1)
-                sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view(-1, 1, 1, 1, 1)
-                
-                # Add noise to latents
-                noisy_latents = sqrt_alpha_prod * latents + sqrt_one_minus_alpha_prod * noise
+                # Add noise using scheduler's method (Flow Matching)
+                noisy_latents = diffusion_scheduler.add_noise(
+                    rearrange(latents, 'b c f h w -> (b f) c h w'),
+                    rearrange(noise, 'b c f h w -> (b f) c h w'),
+                    timestep_indices.repeat_interleave(latents.shape[2])
+                )
+                noisy_latents = rearrange(noisy_latents, '(b f) c h w -> b c f h w', b=batch_size)
                 
                 # Forward pass through the model with autocast for mixed precision
                 # Note: Action module requires batch_size=1, so we process each sample separately
@@ -409,8 +419,14 @@ def finetune_base_model():
                             keyboard_cond=keyboard_actions
                         )
                     
-                    # Calculate loss (MSE between predicted and actual noise)
-                    loss = nn.functional.mse_loss(predicted_noise, noise)
+                    # Calculate loss (Flow Matching uses velocity target: v = noise - x0)
+                    target = diffusion_scheduler.training_target(
+                        rearrange(latents, 'b c f h w -> (b f) c h w'),
+                        rearrange(noise, 'b c f h w -> (b f) c h w'),
+                        timestep_indices.repeat_interleave(latents.shape[2])
+                    )
+                    target = rearrange(target, '(b f) c h w -> b c f h w', b=batch_size)
+                    loss = nn.functional.mse_loss(predicted_noise, target)
                 
                 # Backward pass
                 optimizer.zero_grad()
@@ -423,7 +439,7 @@ def finetune_base_model():
                 # Optimizer step
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                lr_scheduler.step()
                 
                 # Update metrics
                 epoch_loss += loss.item()
@@ -434,7 +450,7 @@ def finetune_base_model():
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'avg_loss': f'{epoch_loss/successful_batches:.4f}',
-                    'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                    'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'
                 })
                 
             except Exception as e:
@@ -449,7 +465,7 @@ def finetune_base_model():
             print(f"\nEpoch {epoch+1} completed:")
             print(f"  Average loss: {avg_loss:.4f}")
             print(f"  Successful batches: {successful_batches}/{len(dataloader)}")
-            print(f"  Learning rate: {scheduler.get_last_lr()[0]:.2e}")
+            print(f"  Learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
             
             # Save checkpoint
             if (epoch + 1) % 2 == 0 or epoch == NUM_EPOCHS - 1:

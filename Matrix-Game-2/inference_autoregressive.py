@@ -22,6 +22,7 @@ from demo_utils.vae_block3 import VAEDecoderWrapper
 from utils.visualize import process_video
 from utils.misc import set_seed
 from utils.conditions import *
+from utils.scheduler import FlowMatchScheduler
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -47,6 +48,14 @@ class AutoregressiveInference:
         
         self._init_config()
         self._init_models()
+        
+        # Initialize diffusion scheduler (Flow Matching)
+        self.scheduler = FlowMatchScheduler(
+            shift=5.0,  # Match the base model
+            sigma_min=0.0,
+            extra_one_step=True
+        )
+        self.scheduler.set_timesteps(100)  # Number of inference steps
         
         self.frame_process = v2.Compose([
             v2.Resize(size=(352, 640), antialias=True),
@@ -153,7 +162,7 @@ class AutoregressiveInference:
 
     def denoise_latents(self, latents, visual_context, cond_concat, mouse_cond, keyboard_cond, num_steps=100):
         """
-        Denoise latents using the diffusion model.
+        Denoise latents using Flow Matching scheduler.
         
         Args:
             latents: Initial noisy latents
@@ -173,25 +182,33 @@ class AutoregressiveInference:
         mouse_cond = mouse_cond.to(dtype=self.weight_dtype)
         keyboard_cond = keyboard_cond.to(dtype=self.weight_dtype)
         
-        # Simple DDPM denoising
-        for t in tqdm(range(1000, 0, -1000//num_steps), desc="Denoising", leave=False):
-            timestep = torch.tensor([t], device=self.device, dtype=self.weight_dtype)
+        # Update scheduler timesteps if different from initialization
+        if num_steps != len(self.scheduler.timesteps):
+            self.scheduler.set_timesteps(num_steps)
+        
+        # Flow Matching denoising loop
+        for i, timestep in enumerate(tqdm(self.scheduler.timesteps, desc="Denoising", leave=False)):
+            # Prepare timestep tensor (match expected format)
+            timestep_tensor = timestep.unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
             
-            # Predict noise
+            # Predict velocity (Flow Matching predicts v = noise - x0)
             with torch.no_grad():
-                predicted_noise = self.model(
+                predicted_velocity = self.model(
                     latents,
-                    timestep,
+                    timestep_tensor,
                     visual_context=visual_context,
                     cond_concat=cond_concat,
                     mouse_cond=mouse_cond,
                     keyboard_cond=keyboard_cond
                 )
             
-            # Denoising step
-            alpha = 1.0 - t / 1000.0
-            beta = 1.0 - alpha
-            latents = (latents - beta ** 0.5 * predicted_noise) / (alpha ** 0.5)
+            # Update latents using scheduler's step function
+            latents = self.scheduler.step(
+                predicted_velocity,
+                timestep,
+                latents,
+                to_final=(i == len(self.scheduler.timesteps) - 1)
+            )
             latents = latents.to(dtype=self.weight_dtype)
         
         return latents
@@ -209,6 +226,8 @@ class AutoregressiveInference:
             
             # Convert: B T C H W -> B T H W C
             frames = rearrange(decoded_video, "B T C H W -> B T H W C")
+            
+            # Normalize from [-1, 1] to [0, 255]
             frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)[0]
         
         return frames
@@ -324,8 +343,6 @@ class AutoregressiveInference:
             
             # Use these latents as context for next generation
             prev_latents = generated_latents.detach()
-            
-            print(f"Generated frames shape: {frames.shape}")
         
         # Concatenate all generated frames
         print("\n" + "="*60)

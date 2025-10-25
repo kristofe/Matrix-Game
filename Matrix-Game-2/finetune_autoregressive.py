@@ -18,6 +18,8 @@ from tqdm import tqdm
 # Import Matrix-Game components
 from wan.modules.model import WanModel
 from convert_unreal_data import UnrealDataset
+from utils.scheduler import FlowMatchScheduler
+from einops import rearrange
 
 def sinusoidal_embedding_1d(freq_dim, t):
     """Create sinusoidal embeddings for time steps."""
@@ -298,8 +300,8 @@ def finetune_autoregressive():
     # Training hyperparameters for autoregressive learning
     CONTEXT_FRAMES = 9   # Input: first 9 frames (3 latent frames)
     TARGET_FRAMES = 9    # Output: next 9 frames (3 latent frames)
-    BATCH_SIZE = 4       # Smaller batch size due to processing 2 sequences
-    NUM_EPOCHS = 15      # More epochs for autoregressive learning
+    BATCH_SIZE = 1       # Smaller batch size due to processing 2 sequences
+    NUM_EPOCHS = 100      # More epochs for autoregressive learning
     LEARNING_RATE = 5e-6  # Lower learning rate for stability
     TRAINING_STRATEGY = 'action_only'
     
@@ -362,7 +364,15 @@ def finetune_autoregressive():
         return 0.5 * (1.0 + math.cos(math.pi * (current_step - warmup_steps) / 
                                      (NUM_EPOCHS * len(dataloader) - warmup_steps)))
     
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # Diffusion scheduler (for noise schedule during training)
+    diffusion_scheduler = FlowMatchScheduler(
+        shift=5.0,  # Match the base model
+        sigma_min=0.0,
+        extra_one_step=True
+    )
+    diffusion_scheduler.set_timesteps(1000, training=True)
     
     # GradScaler for mixed precision
     scaler = torch.cuda.amp.GradScaler(enabled=False)  # bfloat16 doesn't need scaling
@@ -428,17 +438,21 @@ def finetune_autoregressive():
                     device=device, dtype=torch.bfloat16
                 )
                 
-                # Add noise for diffusion training
+                # Add noise for diffusion training using FlowMatchScheduler
                 noise = torch.randn_like(target_latents)
-                timesteps = torch.randint(0, 1000, (batch_size,), device=device).float().to(dtype=torch.bfloat16)
                 
-                # Noise schedule
-                sqrt_alpha_prod = (1 - timesteps / 1000.0) ** 0.5
-                sqrt_one_minus_alpha_prod = (timesteps / 1000.0) ** 0.5
-                sqrt_alpha_prod = sqrt_alpha_prod.view(-1, 1, 1, 1, 1)
-                sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.view(-1, 1, 1, 1, 1)
+                # Sample timesteps from scheduler (indices on CPU for indexing)
+                timestep_indices = torch.randint(0, 1000, (batch_size,), device='cpu')
+                timesteps = diffusion_scheduler.timesteps[timestep_indices].to(device=device, dtype=torch.bfloat16)
+                timestep_indices = timestep_indices.to(device)  # Move back to device for scheduler
                 
-                noisy_latents = sqrt_alpha_prod * target_latents + sqrt_one_minus_alpha_prod * noise
+                # Add noise using scheduler's method (Flow Matching)
+                noisy_latents = diffusion_scheduler.add_noise(
+                    rearrange(target_latents, 'b c f h w -> (b f) c h w'),
+                    rearrange(noise, 'b c f h w -> (b f) c h w'),
+                    timestep_indices.repeat_interleave(target_latents.shape[2])
+                )
+                noisy_latents = rearrange(noisy_latents, '(b f) c h w -> b c f h w', b=batch_size)
                 
                 # Forward pass: predict noise for TARGET frames
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -466,8 +480,14 @@ def finetune_autoregressive():
                             keyboard_cond=target_keyboard
                         )
                     
-                    # Calculate target prediction loss
-                    target_loss = nn.functional.mse_loss(predicted_noise, noise)
+                    # Calculate target prediction loss (Flow Matching uses velocity target)
+                    target_velocity = diffusion_scheduler.training_target(
+                        rearrange(target_latents, 'b c f h w -> (b f) c h w'),
+                        rearrange(noise, 'b c f h w -> (b f) c h w'),
+                        timestep_indices.repeat_interleave(target_latents.shape[2])
+                    )
+                    target_velocity = rearrange(target_velocity, '(b f) c h w -> b c f h w', b=batch_size)
+                    target_loss = nn.functional.mse_loss(predicted_noise, target_velocity)
                     
                     # Optional: Also train on context reconstruction (curriculum learning)
                     if USE_CURRICULUM and epoch < NUM_EPOCHS // 3:
@@ -477,8 +497,12 @@ def finetune_autoregressive():
                             device=device, dtype=torch.bfloat16
                         )
                         context_noise = torch.randn_like(context_latents)
-                        noisy_context = sqrt_alpha_prod[:, :, :, :, :] * context_latents + \
-                                       sqrt_one_minus_alpha_prod[:, :, :, :, :] * context_noise
+                        noisy_context = diffusion_scheduler.add_noise(
+                            rearrange(context_latents, 'b c f h w -> (b f) c h w'),
+                            rearrange(context_noise, 'b c f h w -> (b f) c h w'),
+                            timestep_indices.repeat_interleave(context_latents.shape[2])
+                        )
+                        noisy_context = rearrange(noisy_context, '(b f) c h w -> b c f h w', b=batch_size)
                         
                         context_cond = torch.zeros(
                             batch_size, 20, context_latent_frames, latent_height, latent_width,
@@ -508,7 +532,13 @@ def finetune_autoregressive():
                                 keyboard_cond=context_keyboard
                             )
                         
-                        context_loss = nn.functional.mse_loss(context_predicted, context_noise)
+                        context_velocity = diffusion_scheduler.training_target(
+                            rearrange(context_latents, 'b c f h w -> (b f) c h w'),
+                            rearrange(context_noise, 'b c f h w -> (b f) c h w'),
+                            timestep_indices.repeat_interleave(context_latents.shape[2])
+                        )
+                        context_velocity = rearrange(context_velocity, '(b f) c h w -> b c f h w', b=batch_size)
+                        context_loss = nn.functional.mse_loss(context_predicted, context_velocity)
                         
                         # Combined loss (weighted)
                         loss = 0.3 * context_loss + 0.7 * target_loss
@@ -529,7 +559,7 @@ def finetune_autoregressive():
                 # Optimizer step
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                lr_scheduler.step()
                 
                 # Update metrics
                 epoch_loss += loss.item()
@@ -543,13 +573,13 @@ def finetune_autoregressive():
                         'loss': f'{loss.item():.4f}',
                         'ctx': f'{context_loss.item():.4f}',
                         'tgt': f'{target_loss.item():.4f}',
-                        'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                        'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'
                     })
                 else:
                     pbar.set_postfix({
                         'loss': f'{loss.item():.4f}',
                         'avg': f'{epoch_loss/successful_batches:.4f}',
-                        'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+                        'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'
                     })
                 
             except Exception as e:
@@ -570,7 +600,7 @@ def finetune_autoregressive():
                 avg_context_loss = epoch_context_loss / successful_batches
                 print(f"  Average context loss: {avg_context_loss:.4f}")
             print(f"  Successful batches: {successful_batches}/{len(dataloader)}")
-            print(f"  Learning rate: {scheduler.get_last_lr()[0]:.2e}")
+            print(f"  Learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
             
             # Save checkpoint if best loss
             if avg_loss < best_loss:
