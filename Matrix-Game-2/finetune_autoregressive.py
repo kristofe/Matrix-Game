@@ -2,6 +2,8 @@
 """
 Autoregressive Fine-tuning for Matrix-Game Base Model (WanModel)
 Trains the model to generate video continuations for long-form generation
+
+Key: Uses VAE to encode real context/target frames for proper autoregressive training
 """
 
 import torch
@@ -20,6 +22,7 @@ from wan.modules.model import WanModel
 from convert_unreal_data import UnrealDataset
 from utils.scheduler import FlowMatchScheduler
 from einops import rearrange
+from wan.vae.wanx_vae import get_wanx_vae_wrapper
 
 def sinusoidal_embedding_1d(freq_dim, t):
     """Create sinusoidal embeddings for time steps."""
@@ -301,12 +304,12 @@ def finetune_autoregressive():
     CONTEXT_FRAMES = 9   # Input: first 9 frames (3 latent frames)
     TARGET_FRAMES = 9    # Output: next 9 frames (3 latent frames)
     BATCH_SIZE = 1       # Smaller batch size due to processing 2 sequences
-    NUM_EPOCHS = 100      # More epochs for autoregressive learning
+    NUM_EPOCHS =  50      # More epochs for autoregressive learning
     LEARNING_RATE = 5e-6  # Lower learning rate for stability
     TRAINING_STRATEGY = 'action_only'
     
     # Curriculum learning (optional)
-    USE_CURRICULUM = True  # Start with easier tasks, gradually increase difficulty
+    USE_CURRICULUM = False  # Disabled to save memory (model too large for double forward passes)
     
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -320,6 +323,13 @@ def finetune_autoregressive():
     
     # Analyze model architecture
     analyze_model(model)
+    
+    # Load VAE for encoding frames to latents
+    print("\nLoading VAE encoder...")
+    vae = get_wanx_vae_wrapper("models/", torch.float16)
+    vae.requires_grad_(False)
+    vae.eval()
+    vae = vae.to(device, torch.float16)
     
     # Configure training strategy
     model = configure_training_strategy(model, TRAINING_STRATEGY)
@@ -373,6 +383,7 @@ def finetune_autoregressive():
         extra_one_step=True
     )
     diffusion_scheduler.set_timesteps(1000, training=True)
+    # Scheduler tensors will be moved to the correct device automatically by add_noise()
     
     # GradScaler for mixed precision
     scaler = torch.cuda.amp.GradScaler(enabled=False)  # bfloat16 doesn't need scaling
@@ -421,36 +432,44 @@ def finetune_autoregressive():
                 context_latent_frames = (num_context_frames - 1) // vae_time_compression + 1
                 target_latent_frames = (num_target_frames - 1) // vae_time_compression + 1
                 
-                # Create placeholder latents for target (what we want to generate)
-                target_latents = torch.randn(
-                    batch_size, 16, target_latent_frames, latent_height, latent_width,
-                    device=device, dtype=torch.bfloat16
-                )
+                # Encode context and target frames using VAE
+                with torch.no_grad():
+                    # Prepare frames: [B, T, H, W, C] -> [B, C, T, H, W]
+                    context_for_vae = context_frames.permute(0, 4, 1, 2, 3).to(dtype=torch.float16)
+                    target_for_vae = target_frames.permute(0, 4, 1, 2, 3).to(dtype=torch.float16)
+                    
+                    # Encode context frames to latents
+                    tiler_kwargs = {"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
+                    context_latents = vae.encode(context_for_vae, device=device, **tiler_kwargs)
+                    context_latents = context_latents[:, :, :context_latent_frames, :, :].to(device=device, dtype=torch.bfloat16)
+                    
+                    # Encode target frames to latents  
+                    target_latents = vae.encode(target_for_vae, device=device, **tiler_kwargs)
+                    target_latents = target_latents[:, :, :target_latent_frames, :, :].to(device=device, dtype=torch.bfloat16)
+                    
+                    # Get visual context (CLIP encoding) from context frames
+                    visual_context = vae.clip.encode_video(context_for_vae).to(device=device, dtype=torch.bfloat16)
                 
-                # Create visual context from context frames (using CLIP)
-                # In practice, this would come from the VAE encoder
-                visual_context = torch.randn(batch_size, 1280, device=device, dtype=torch.bfloat16)
-                
-                # Create cond_concat that represents the context frames
-                # This tells the model "these are the frames we've already generated"
-                cond_concat = torch.zeros(
-                    batch_size, 20, target_latent_frames, latent_height, latent_width,
-                    device=device, dtype=torch.bfloat16
-                )
+                # Create cond_concat with real context latents
+                # Mask: 1 for context frames (known), 0 for target frames (to generate)
+                mask_cond = torch.ones_like(context_latents)
+                cond_concat = torch.cat([mask_cond[:, :4], context_latents], dim=1)
                 
                 # Add noise for diffusion training using FlowMatchScheduler
                 noise = torch.randn_like(target_latents)
                 
-                # Sample timesteps from scheduler (indices on CPU for indexing)
-                timestep_indices = torch.randint(0, 1000, (batch_size,), device='cpu')
+                # Sample timesteps from scheduler (indices must be on CPU to index CPU tensor)
+                timestep_indices = torch.randint(0, 1000, (batch_size,))
                 timesteps = diffusion_scheduler.timesteps[timestep_indices].to(device=device, dtype=torch.bfloat16)
-                timestep_indices = timestep_indices.to(device)  # Move back to device for scheduler
                 
                 # Add noise using scheduler's method (Flow Matching)
+                # Expand timesteps to match the flattened batch format
+                timesteps_expanded = timesteps.repeat_interleave(target_latents.shape[2])
+                
                 noisy_latents = diffusion_scheduler.add_noise(
                     rearrange(target_latents, 'b c f h w -> (b f) c h w'),
                     rearrange(noise, 'b c f h w -> (b f) c h w'),
-                    timestep_indices.repeat_interleave(target_latents.shape[2])
+                    timesteps_expanded
                 )
                 noisy_latents = rearrange(noisy_latents, '(b f) c h w -> b c f h w', b=batch_size)
                 
@@ -484,23 +503,23 @@ def finetune_autoregressive():
                     target_velocity = diffusion_scheduler.training_target(
                         rearrange(target_latents, 'b c f h w -> (b f) c h w'),
                         rearrange(noise, 'b c f h w -> (b f) c h w'),
-                        timestep_indices.repeat_interleave(target_latents.shape[2])
+                        timesteps_expanded
                     )
                     target_velocity = rearrange(target_velocity, '(b f) c h w -> b c f h w', b=batch_size)
                     target_loss = nn.functional.mse_loss(predicted_noise, target_velocity)
                     
                     # Optional: Also train on context reconstruction (curriculum learning)
-                    if USE_CURRICULUM and epoch < NUM_EPOCHS // 3:
+                    # Only do curriculum every 3rd batch to save memory
+                    if USE_CURRICULUM and epoch < NUM_EPOCHS // 3 and batch_idx % 3 == 0:
                         # Early training: also learn to reconstruct context
-                        context_latents = torch.randn(
-                            batch_size, 16, context_latent_frames, latent_height, latent_width,
-                            device=device, dtype=torch.bfloat16
-                        )
+                        # Use the REAL context latents we encoded above (not random!)
                         context_noise = torch.randn_like(context_latents)
+                        # Expand timesteps for context frames
+                        context_timesteps_expanded = timesteps.repeat_interleave(context_latents.shape[2])
                         noisy_context = diffusion_scheduler.add_noise(
                             rearrange(context_latents, 'b c f h w -> (b f) c h w'),
                             rearrange(context_noise, 'b c f h w -> (b f) c h w'),
-                            timestep_indices.repeat_interleave(context_latents.shape[2])
+                            context_timesteps_expanded
                         )
                         noisy_context = rearrange(noisy_context, '(b f) c h w -> b c f h w', b=batch_size)
                         
@@ -535,7 +554,7 @@ def finetune_autoregressive():
                         context_velocity = diffusion_scheduler.training_target(
                             rearrange(context_latents, 'b c f h w -> (b f) c h w'),
                             rearrange(context_noise, 'b c f h w -> (b f) c h w'),
-                            timestep_indices.repeat_interleave(context_latents.shape[2])
+                            context_timesteps_expanded
                         )
                         context_velocity = rearrange(context_velocity, '(b f) c h w -> b c f h w', b=batch_size)
                         context_loss = nn.functional.mse_loss(context_predicted, context_velocity)
@@ -543,6 +562,10 @@ def finetune_autoregressive():
                         # Combined loss (weighted)
                         loss = 0.3 * context_loss + 0.7 * target_loss
                         epoch_context_loss += context_loss.item()
+                        
+                        # Clear intermediate tensors to save memory
+                        del noisy_context, context_predicted, context_velocity, context_noise
+                        torch.cuda.empty_cache()
                     else:
                         # Later training: focus only on prediction
                         loss = target_loss
@@ -562,22 +585,31 @@ def finetune_autoregressive():
                 lr_scheduler.step()
                 
                 # Update metrics
-                epoch_loss += loss.item()
-                epoch_target_loss += target_loss.item()
+                loss_value = loss.item()
+                target_loss_value = target_loss.item()
+                epoch_loss += loss_value
+                epoch_target_loss += target_loss_value
                 successful_batches += 1
                 global_step += 1
+                
+                # Clear intermediate tensors to free memory
+                del noisy_latents, predicted_noise, target_velocity, loss
+                del context_latents, target_latents, visual_context, cond_concat
+                del noise, timesteps, timesteps_expanded, target_loss
+                if batch_idx % 10 == 0:  # Periodic aggressive cleanup
+                    torch.cuda.empty_cache()
                 
                 # Update progress bar
                 if USE_CURRICULUM and epoch < NUM_EPOCHS // 3:
                     pbar.set_postfix({
-                        'loss': f'{loss.item():.4f}',
-                        'ctx': f'{context_loss.item():.4f}',
-                        'tgt': f'{target_loss.item():.4f}',
+                        'loss': f'{loss_value:.4f}',
+                        'ctx': '0.0000',
+                        'tgt': f'{target_loss_value:.4f}',
                         'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'
                     })
                 else:
                     pbar.set_postfix({
-                        'loss': f'{loss.item():.4f}',
+                        'loss': f'{loss_value:.4f}',
                         'avg': f'{epoch_loss/successful_batches:.4f}',
                         'lr': f'{lr_scheduler.get_last_lr()[0]:.2e}'
                     })

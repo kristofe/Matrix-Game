@@ -310,6 +310,7 @@ def finetune_base_model():
         extra_one_step=True
     )
     diffusion_scheduler.set_timesteps(1000, training=True)
+    # Scheduler tensors will be moved to the correct device automatically by add_noise()
     
     # GradScaler for mixed precision training with bfloat16
     scaler = torch.cuda.amp.GradScaler(enabled=False)  # bfloat16 doesn't need scaling
@@ -380,16 +381,17 @@ def finetune_base_model():
                 # Diffusion training: add noise to latents using FlowMatchScheduler
                 noise = torch.randn_like(latents)
                 
-                # Sample timesteps from scheduler (indices on CPU for indexing)
-                timestep_indices = torch.randint(0, 1000, (batch_size,), device='cpu')
+                # Sample timesteps from scheduler (indices must be on CPU to index CPU tensor)
+                timestep_indices = torch.randint(0, 1000, (batch_size,))
                 timesteps = diffusion_scheduler.timesteps[timestep_indices].to(device=device, dtype=torch.bfloat16)
-                timestep_indices = timestep_indices.to(device)  # Move back to device for scheduler
                 
                 # Add noise using scheduler's method (Flow Matching)
+                # Expand timesteps to match the flattened batch format
+                timesteps_expanded = timesteps.repeat_interleave(latents.shape[2])
                 noisy_latents = diffusion_scheduler.add_noise(
                     rearrange(latents, 'b c f h w -> (b f) c h w'),
                     rearrange(noise, 'b c f h w -> (b f) c h w'),
-                    timestep_indices.repeat_interleave(latents.shape[2])
+                    timesteps_expanded
                 )
                 noisy_latents = rearrange(noisy_latents, '(b f) c h w -> b c f h w', b=batch_size)
                 
@@ -423,7 +425,7 @@ def finetune_base_model():
                     target = diffusion_scheduler.training_target(
                         rearrange(latents, 'b c f h w -> (b f) c h w'),
                         rearrange(noise, 'b c f h w -> (b f) c h w'),
-                        timestep_indices.repeat_interleave(latents.shape[2])
+                        timesteps_expanded
                     )
                     target = rearrange(target, '(b f) c h w -> b c f h w', b=batch_size)
                     loss = nn.functional.mse_loss(predicted_noise, target)

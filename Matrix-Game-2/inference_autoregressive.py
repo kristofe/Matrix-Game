@@ -188,7 +188,7 @@ class AutoregressiveInference:
         
         # Flow Matching denoising loop
         for i, timestep in enumerate(tqdm(self.scheduler.timesteps, desc="Denoising", leave=False)):
-            # Prepare timestep tensor (match expected format)
+            # Prepare timestep tensor for model (scalar -> [1])
             timestep_tensor = timestep.unsqueeze(0).to(device=self.device, dtype=self.weight_dtype)
             
             # Predict velocity (Flow Matching predicts v = noise - x0)
@@ -202,13 +202,27 @@ class AutoregressiveInference:
                     keyboard_cond=keyboard_cond
                 )
             
+            # Rearrange for scheduler (needs [B*T] format)
+            batch_size = latents.shape[0]
+            num_frames = latents.shape[2]
+            
+            # Flatten spatial-temporal for scheduler
+            pred_v_flat = rearrange(predicted_velocity, 'b c t h w -> (b t) c h w')
+            latents_flat = rearrange(latents, 'b c t h w -> (b t) c h w')
+            
+            # Create timestep tensor for each frame [B*T]
+            timestep_batch = timestep.unsqueeze(0).repeat(batch_size * num_frames).to(self.device)
+            
             # Update latents using scheduler's step function
-            latents = self.scheduler.step(
-                predicted_velocity,
-                timestep,
-                latents,
+            latents_flat = self.scheduler.step(
+                pred_v_flat,
+                timestep_batch,
+                latents_flat,
                 to_final=(i == len(self.scheduler.timesteps) - 1)
             )
+            
+            # Reshape back
+            latents = rearrange(latents_flat, '(b t) c h w -> b c t h w', b=batch_size, t=num_frames)
             latents = latents.to(dtype=self.weight_dtype)
         
         return latents
@@ -279,8 +293,9 @@ class AutoregressiveInference:
         # Get visual context (CLIP embedding)
         visual_context = self.vae.clip.encode_video(image_tensor)
         
-        # Storage for all generated frames and actions
+        # Storage for all generated frames, latents, and actions
         all_frames = []
+        all_latents = []  # Store all generated latents for context accumulation
         all_keyboard_actions = []
         all_mouse_actions = []
         
@@ -312,10 +327,11 @@ class AutoregressiveInference:
                 mask_cond[:, :, 1:] = 0  # Mask all but first frame
                 cond_concat = torch.cat([mask_cond[:, :4], img_cond], dim=1)
             else:
-                # Subsequent generations: use last generated latents as context
-                # Create mask that conditions on previous frame
+                # Subsequent generations: use previous chunk latents as context
+                # This matches the training setup: context frames + target frames
+                # Use ALL frames from previous generation as context
                 mask_cond = torch.ones_like(prev_latents)
-                mask_cond[:, :, 1:] = 0
+                # All previous frames are context (mask=1), new frames will be generated
                 cond_concat = torch.cat([mask_cond[:, :4], prev_latents], dim=1)
             
             # Initialize noise
@@ -341,7 +357,8 @@ class AutoregressiveInference:
             frames = self.decode_latents_to_frames(generated_latents)
             all_frames.append(frames)
             
-            # Use these latents as context for next generation
+            # Store latents and use as context for next generation
+            all_latents.append(generated_latents.detach())
             prev_latents = generated_latents.detach()
         
         # Concatenate all generated frames
