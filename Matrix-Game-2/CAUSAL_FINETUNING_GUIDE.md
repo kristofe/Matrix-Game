@@ -72,7 +72,7 @@ After training, use your finetuned model:
 python inference.py \
     --config_path configs/inference_yaml/inference_universal.yaml \
     --checkpoint_path checkpoints/causal_distilled_best.safetensors \
-    --img_path demo_images/universal/0000.png \
+    --img_path data/frame_0100.png \
     --output_folder outputs \
     --num_output_frames 150 \
     --pretrained_model_path models/
