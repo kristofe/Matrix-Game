@@ -89,6 +89,36 @@ python inference.py     --config_path configs/inference_yaml/inference_universal
 ### Tips
 - In the current version, upward movement for camera may cause brief rendering glitches (e.g., black screens). A fix is planned for future updates. Adjust movement slightly or change direction to resolve it.
 
+## 🎯 Finetuning
+
+You can finetune the causal distilled model on your own gameplay data! The finetuned model will work with the efficient `inference.py` script.
+
+**Quick Start**:
+```bash
+# Train the model (35 seconds per epoch on RTX 3090)
+python finetune_causal_distilled.py \
+    --data_dir data \
+    --sequence_length 9 \
+    --num_epochs 10 \
+    --batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --learning_rate 1e-5
+
+# Run inference with your finetuned model
+python inference.py \
+    --config_path configs/inference_yaml/inference_universal.yaml \
+    --checkpoint_path checkpoints/causal_distilled_best.safetensors \
+    --img_path demo_images/universal/0000.png \
+    --output_folder outputs \
+    --num_output_frames 150 \
+    --pretrained_model_path models/
+```
+
+**Data Format**: 
+- Frames: `data/frame_0001.png`, `data/frame_0002.png`, ...
+- Actions: `data/input.csv` (format: `key,time,frame`)
+
+See [`CAUSAL_FINETUNING_GUIDE.md`](CAUSAL_FINETUNING_GUIDE.md) for complete documentation, troubleshooting, and technical details.
 
 ## ⭐ Acknowledgements
 
