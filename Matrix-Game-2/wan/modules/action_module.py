@@ -25,8 +25,10 @@ except:
 
 
 DISABLE_COMPILE = False  # get os env
-flex_attention = torch.compile(
-    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+# Commenting out torch.compile for flex_attention to avoid Triton compilation errors
+# with "Placeholder.DESCRIPTIVE_NAME" - see https://github.com/pytorch/pytorch/issues/133254
+# flex_attention = torch.compile(
+#     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
     
 
 class WanRMSNorm(nn.Module):
