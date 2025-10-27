@@ -38,6 +38,10 @@ def parse_args():
     parser.add_argument("--config_path", type=str,
                         default="configs/inference_yaml/inference_universal.yaml",
                         help="Path to model config")
+    parser.add_argument("--model_variant", type=str, choices=["universal", "gta_drive"], default="gta_drive",
+                        help="Which distilled model variant to use for training")
+    parser.add_argument("--keyboard_only", action="store_true",
+                        help="Condition only on keyboard; omit mouse inputs during training")
     parser.add_argument("--sequence_length", type=int, default=9,
                         help="Number of frames per training sample (9 recommended)")
     parser.add_argument("--batch_size", type=int, default=1,
@@ -62,6 +66,8 @@ def main():
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Pretrained checkpoint: {args.pretrained_checkpoint}")
+    print(f"Model variant: {args.model_variant}")
+    print(f"Keyboard only: {args.keyboard_only}")
     print(f"Data directory: {args.data_dir}")
     print(f"Frames per sample: {args.sequence_length}")
     print(f"Batch size: {args.batch_size}")
@@ -74,6 +80,15 @@ def main():
     # Load config
     print("\nLoading model config...")
     config = OmegaConf.load(args.config_path)
+    # Switch model config directory based on selected variant
+    if args.model_variant == "gta_drive":
+        # Point to GTA distilled model config directory
+        config.model_kwargs.model_config = "configs/distilled_model/gta_drive"
+        # If not overridden, default to GTA distilled pretrained weights
+        if args.pretrained_checkpoint == "models/base_distilled_model/base_distill.safetensors":
+            args.pretrained_checkpoint = "models/gta_distilled_model/gta_keyboard2dim.safetensors"
+    else:
+        config.model_kwargs.model_config = "configs/distilled_model/universal"
     
     # Initialize model
     print("\nInitializing causal model...")
@@ -162,7 +177,13 @@ def main():
                 # UnrealDataset returns: video_frames, keyboard_actions, mouse_actions
                 frames = batch['video_frames'].to(device)  # [B, T, H, W, C]
                 keyboard_per_frame = batch['keyboard_actions'].to(device, dtype=torch.bfloat16)  # [B, T, 4]
-                mouse_per_frame = batch['mouse_actions'].to(device, dtype=torch.bfloat16)  # [B, T, 2]
+                # Optionally drop mouse entirely for keyboard-only training
+                mouse_per_frame = None if args.keyboard_only else batch['mouse_actions'].to(device, dtype=torch.bfloat16)
+
+                # If training with GTA variant, reduce keyboard to 2D [W, S]
+                if args.model_variant == "gta_drive":
+                    # keyboard_per_frame layout is [W, A, S, D]; select W and S
+                    keyboard_per_frame = keyboard_per_frame[..., [0, 2]]  # [B, T, 2]
                 
                 # Normalize frames to [-1, 1]
                 frames = normalize_frames(frames)
@@ -200,10 +221,12 @@ def main():
                 # Interpolate actions to match the expected action sequence length
                 # Simple approach: repeat each action 4 times, then trim to match
                 keyboard_expanded = keyboard_per_frame.repeat_interleave(4, dim=1)
-                mouse_expanded = mouse_per_frame.repeat_interleave(4, dim=1)
-                
                 keyboard = keyboard_expanded[:, :num_action_steps]
-                mouse = mouse_expanded[:, :num_action_steps]
+                if mouse_per_frame is not None:
+                    mouse_expanded = mouse_per_frame.repeat_interleave(4, dim=1)
+                    mouse = mouse_expanded[:, :num_action_steps]
+                else:
+                    mouse = None
                 
                 # Prepare conditioning
                 # For causal model, we use first frame as condition
@@ -245,9 +268,10 @@ def main():
                 conditional_dict = {
                     "cond_concat": cond_concat,
                     "visual_context": visual_context,
-                    "mouse_cond": mouse,
                     "keyboard_cond": keyboard
                 }
+                if mouse is not None:
+                    conditional_dict["mouse_cond"] = mouse
                 
                 predicted_velocity = model(
                     noisy_latents,
@@ -304,8 +328,15 @@ def main():
                 # Aggressive memory cleanup
                 del noisy_latents, noisy_latents_flat, predicted_velocity, target_velocity, target_velocity_flat, loss
                 del latents, latents_flat, visual_context, cond_concat, noise
-                del frames, frames_vae, keyboard, mouse, conditional_dict
-                del keyboard_per_frame, mouse_per_frame, keyboard_expanded, mouse_expanded
+                del frames, frames_vae, keyboard, conditional_dict
+                if mouse is not None:
+                    del mouse
+                del keyboard_per_frame
+                if mouse_per_frame is not None:
+                    del mouse_per_frame
+                del keyboard_expanded
+                if 'mouse_expanded' in locals():
+                    del mouse_expanded
                 
                 # Clear cache after every batch to prevent OOM
                 torch.cuda.empty_cache()
@@ -381,9 +412,10 @@ def main():
     print("=" * 60)
     print(f"\nYou can now run inference with:")
     print(f"python inference.py \\")
-    print(f"    --config_path {args.config_path} \\")
+    recommend_config = "configs/inference_yaml/inference_gta_drive.yaml" if args.model_variant == "gta_drive" else args.config_path
+    print(f"    --config_path {recommend_config} \\")
     print(f"    --checkpoint_path {best_path} \\")
-    print(f"    --img_path demo_images/universal/0000.png \\")
+    print(f"    --img_path demo_images/universal/0000.png ")
     print(f"    --output_folder outputs \\")
     print(f"    --num_output_frames 150 \\")
     print(f"    --pretrained_model_path models/")

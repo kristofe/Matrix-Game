@@ -103,7 +103,10 @@ class UnrealDataset(Dataset):
         In a real implementation, you'd extract mouse data from your input.
         """
         # Return small random movements (normalized to [-1, 1])
-        mouse_actions = np.random.normal(0, 0.1, (sequence_length, 2)).astype(np.float32)
+        # mouse_actions = np.random.normal(0, 0.1, (sequence_length, 2)).astype(np.float32)
+
+        #actuall lets zero them out
+        mouse_actions = np.zeros((sequence_length, 2)).astype(np.float32)
         return mouse_actions
     
     def _load_frame(self, frame_path):
