@@ -39,3 +39,4 @@ onnxconverter_common
 flask
 flask-socketio
 torchao
+peft

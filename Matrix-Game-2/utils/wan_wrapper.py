@@ -58,7 +58,7 @@ class WanVAEWrapper(torch.nn.Module): # todo
             decode_function = self.model.decode
 
         output = []
-        for u in zs:
+        for u in latent:
             output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
         output = torch.stack(output, dim=0)
         return output
@@ -142,13 +142,58 @@ class WanDiffusionWrapper(torch.nn.Module):
 
     def forward(
         self,
-        noisy_image_or_video: torch.Tensor, conditional_dict: dict,
-        timestep: torch.Tensor, kv_cache: Optional[List[dict]] = None, kv_cache_mouse: Optional[List[dict]] = None, kv_cache_keyboard: Optional[List[dict]] = None,
+        *args,
+        noisy_image_or_video: Optional[torch.Tensor] = None,
+        conditional_dict: Optional[dict] = None,
+        timestep: Optional[torch.Tensor] = None,
+        kv_cache: Optional[List[dict]] = None,
+        kv_cache_mouse: Optional[List[dict]] = None,
+        kv_cache_keyboard: Optional[List[dict]] = None,
         crossattn_cache: Optional[List[dict]] = None,
         current_start: Optional[int] = None,
-        cache_start: Optional[int] = None
+        cache_start: Optional[int] = None,
+        **kwargs  # Accept additional kwargs to handle PEFT wrappers that may pass unexpected args
     ) -> torch.Tensor:
+        # Handle both positional and keyword arguments for PEFT compatibility
+        # Positional args: (noisy_image_or_video, conditional_dict, timestep)
+        if len(args) >= 3:
+            noisy_image_or_video = args[0] if noisy_image_or_video is None else noisy_image_or_video
+            conditional_dict = args[1] if conditional_dict is None else conditional_dict
+            timestep = args[2] if timestep is None else timestep
+        elif len(args) == 2:
+            noisy_image_or_video = args[0] if noisy_image_or_video is None else noisy_image_or_video
+            conditional_dict = args[1] if conditional_dict is None else conditional_dict
+        elif len(args) == 1:
+            noisy_image_or_video = args[0] if noisy_image_or_video is None else noisy_image_or_video
+        
+        # Also try to extract from kwargs in case PEFT passes them as keywords
+        if noisy_image_or_video is None:
+            noisy_image_or_video = kwargs.pop('noisy_image_or_video', None)
+        if conditional_dict is None:
+            conditional_dict = kwargs.pop('conditional_dict', None)
+        if timestep is None:
+            timestep = kwargs.pop('timestep', None)
+        
+        # Extract expected kwargs from kwargs dict (PEFT might pass them there)
+        if kv_cache is None:
+            kv_cache = kwargs.pop('kv_cache', None)
+        if kv_cache_mouse is None:
+            kv_cache_mouse = kwargs.pop('kv_cache_mouse', None)
+        if kv_cache_keyboard is None:
+            kv_cache_keyboard = kwargs.pop('kv_cache_keyboard', None)
+        if crossattn_cache is None:
+            crossattn_cache = kwargs.pop('crossattn_cache', None)
+        if current_start is None:
+            current_start = kwargs.pop('current_start', None)
+        if cache_start is None:
+            cache_start = kwargs.pop('cache_start', None)
+        
+        # Ignore any remaining unexpected kwargs (like input_ids, attention_mask, etc.)
+        # These are commonly passed by PEFT wrappers but not needed by our model
     
+        assert noisy_image_or_video is not None, f"noisy_image_or_video is required. Got args={len(args)}, kwargs_keys={list(kwargs.keys())}"
+        assert conditional_dict is not None, f"conditional_dict is required. Got args={len(args)}, kwargs_keys={list(kwargs.keys())}"
+        assert timestep is not None, f"timestep is required. Got args={len(args)}, kwargs_keys={list(kwargs.keys())}"
         assert noisy_image_or_video.shape[1] == 16
         # [B, F] -> [B]
         if self.uniform_timestep:
