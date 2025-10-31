@@ -19,7 +19,7 @@ from wan.vae.wanx_vae import get_wanx_vae_wrapper
 from omegaconf import OmegaConf
 from convert_unreal_data import UnrealDataset
 from einops import rearrange
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 def normalize_frames(frames):
     """Convert frames from [0, 1] to [-1, 1] for model input."""
@@ -160,6 +160,11 @@ def main():
         task_type=TaskType.FEATURE_EXTRACTION,
     )
 
+    # Store base model reference before PEFT wrapping (for key comparison after merging)
+    base_model_ref = model
+    original_state_dict_keys = set(model.state_dict().keys())
+    print(f"Original model has {len(original_state_dict_keys)} parameters")
+    
     model = get_peft_model(model, lora_config)
     model = model.to(device, dtype=torch.bfloat16)
     model.train()
@@ -452,28 +457,133 @@ def main():
         avg_loss = epoch_loss / len(dataloader)
         print(f"\nEpoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
         
-        # Save checkpoint
+        # Save checkpoint (adapter weights only - for resuming training if needed)
+        # NOTE: Periodic checkpoints save only adapter weights to preserve training state.
+        # Use final/best models (merged) for inference with the regular inference script.
         if (epoch + 1) % args.save_every == 0:
             checkpoint_path = os.path.join(
                 args.checkpoint_dir, 
                 f"causal_distilled_lora_epoch{epoch+1}.safetensors"
             )
-            print(f"Saving checkpoint to {checkpoint_path}...")
-            save_file(model.state_dict(), checkpoint_path)
+            print(f"Saving checkpoint adapter weights to {checkpoint_path}...")
+            # Save only adapter weights (can't merge without breaking training state)
+            if isinstance(model, PeftModel):
+                adapter_state = model.get_peft_state_dict()
+                save_file(adapter_state, checkpoint_path)
+                print(f"  NOTE: This checkpoint contains only LoRA adapter weights.")
+                print(f"  To use for inference, merge with base model first.")
+            else:
+                save_file(model.state_dict(), checkpoint_path)
         
-        # Save best model
+        # Save best model (merged for inference)
         if avg_loss < best_loss:
             best_loss = avg_loss
             best_path = os.path.join(args.checkpoint_dir, "causal_distilled_lora_best.safetensors")
-            print(f"New best model! Saving to {best_path}...")
-            save_file(model.state_dict(), best_path)
+            print(f"New best model! Saving merged model to {best_path} (ready for inference)...")
+            if isinstance(model, PeftModel):
+                # Merge adapters into base model for inference compatibility
+                # merge_and_unload() computes: W_merged = W_base + (lora_B @ lora_A) * (alpha/rank)
+                # It returns the base model (WanDiffusionWrapper) with merged weights
+                merged_model = model.merge_and_unload()
+                merged_state_dict = merged_model.state_dict()
+                merged_keys = set(merged_state_dict.keys())
+                
+                # Verify keys match original model structure (for inference compatibility)
+                if merged_keys == original_state_dict_keys:
+                    print(f"  ✓ Merged model keys match original ({len(merged_keys)} parameters)")
+                    save_file(merged_state_dict, best_path)
+                else:
+                    # Check for common prefix differences - try multiple prefix patterns
+                    # PEFT merge_and_unload() may leave base_model.model.model. or base_model.model. prefix
+                    fixed_state_dict = None
+                    prefix_removed = None
+                    
+                    # Try removing base_model.model.model. -> model.
+                    merged_no_prefix = {k.replace('base_model.model.model.', 'model.') if 'base_model.model.model.' in k else k for k in merged_keys}
+                    if merged_no_prefix == original_state_dict_keys:
+                        prefix_removed = 'base_model.model.model.'
+                        fixed_state_dict = {k.replace('base_model.model.model.', 'model.'): v for k, v in merged_state_dict.items()}
+                    else:
+                        # Try removing base_model.model. -> model.
+                        merged_no_prefix = {k.replace('base_model.model.', 'model.') if 'base_model.model.' in k else k for k in merged_keys}
+                        if merged_no_prefix == original_state_dict_keys:
+                            prefix_removed = 'base_model.model.'
+                            fixed_state_dict = {k.replace('base_model.model.', 'model.'): v for k, v in merged_state_dict.items()}
+                        else:
+                            # Try removing base_model. -> (empty)
+                            merged_no_prefix = {k.replace('base_model.', '') if k.startswith('base_model.') else k for k in merged_keys}
+                            if merged_no_prefix == original_state_dict_keys:
+                                prefix_removed = 'base_model.'
+                                fixed_state_dict = {k.replace('base_model.', ''): v for k, v in merged_state_dict.items()}
+                    
+                    if fixed_state_dict is not None:
+                        print(f"  ⚠ Merged model has '{prefix_removed}' prefix - removing for compatibility...")
+                        save_file(fixed_state_dict, best_path)
+                    else:
+                        print(f"  ⚠ WARNING: Key mismatch detected!")
+                        print(f"    Original keys: {len(original_state_dict_keys)}")
+                        print(f"    Merged keys: {len(merged_keys)}")
+                        print(f"    Missing in merged: {original_state_dict_keys - merged_keys}")
+                        print(f"    Extra in merged: {merged_keys - original_state_dict_keys}")
+                        print(f"    Saving anyway - may need manual key adjustment for inference")
+                        save_file(merged_state_dict, best_path)
+                
+                # Re-create PEFT model to continue training (with fresh adapters - will continue from merged state)
+                # Note: This means best model checkpoint breaks training continuity, but it's ready for inference
+                model = get_peft_model(merged_model, lora_config)
+                model = model.to(device, dtype=torch.bfloat16)
+                model.train()
+            else:
+                save_file(model.state_dict(), best_path)
         
         torch.cuda.empty_cache()
     
     # Save final model
     final_path = os.path.join(args.checkpoint_dir, "causal_distilled_lora_final.safetensors")
     print(f"\nTraining complete! Saving final model to {final_path}...")
-    save_file(model.state_dict(), final_path)
+    # Merge LoRA adapters into base model for inference compatibility
+    if isinstance(model, PeftModel):
+        # Use PEFT's built-in merge and unload for final save
+        merged_model = model.merge_and_unload()
+        merged_state_dict = merged_model.state_dict()
+        merged_keys = set(merged_state_dict.keys())
+        
+        # Verify keys match original model structure
+        if merged_keys == original_state_dict_keys:
+            print(f"✓ Merged final model keys match original ({len(merged_keys)} parameters)")
+            save_file(merged_state_dict, final_path)
+        else:
+            # Remove base_model prefix if present - try multiple prefix patterns
+            # PEFT merge_and_unload() may leave base_model.model.model. or base_model.model. prefix
+            fixed_state_dict = None
+            prefix_removed = None
+            
+            # Try removing base_model.model.model. -> model.
+            merged_no_prefix = {k.replace('base_model.model.model.', 'model.') if 'base_model.model.model.' in k else k for k in merged_keys}
+            if merged_no_prefix == original_state_dict_keys:
+                prefix_removed = 'base_model.model.model.'
+                fixed_state_dict = {k.replace('base_model.model.model.', 'model.'): v for k, v in merged_state_dict.items()}
+            else:
+                # Try removing base_model.model. -> model.
+                merged_no_prefix = {k.replace('base_model.model.', 'model.') if 'base_model.model.' in k else k for k in merged_keys}
+                if merged_no_prefix == original_state_dict_keys:
+                    prefix_removed = 'base_model.model.'
+                    fixed_state_dict = {k.replace('base_model.model.', 'model.'): v for k, v in merged_state_dict.items()}
+                else:
+                    # Try removing base_model. -> (empty)
+                    merged_no_prefix = {k.replace('base_model.', '') if k.startswith('base_model.') else k for k in merged_keys}
+                    if merged_no_prefix == original_state_dict_keys:
+                        prefix_removed = 'base_model.'
+                        fixed_state_dict = {k.replace('base_model.', ''): v for k, v in merged_state_dict.items()}
+            
+            if fixed_state_dict is not None:
+                print(f"  Removing '{prefix_removed}' prefix from keys for compatibility...")
+                save_file(fixed_state_dict, final_path)
+            else:
+                print(f"  WARNING: Key structure differs - saving as-is")
+                save_file(merged_state_dict, final_path)
+    else:
+        save_file(model.state_dict(), final_path)
     
     # Save training info
     info_path = os.path.join(args.checkpoint_dir, "causal_distilled_lora_training_info.txt")
@@ -495,14 +605,14 @@ def main():
     print("TRAINING COMPLETE!")
     print("=" * 60)
     print(f"\nYou can now run inference with:")
-    print(f"python inference.py \\")
+    print(f"python inference.py ", end="")
     recommend_config = "configs/inference_yaml/inference_gta_drive.yaml" if args.model_variant == "gta_drive" else args.config_path
-    print(f"    --config_path {recommend_config} \\")
-    print(f"    --checkpoint_path {best_path} \\")
-    print(f"    --img_path data/frame_0100.png ")
-    print(f"    --output_folder outputs \\")
-    print(f"    --num_output_frames 50 \\")
-    print(f"    --pretrained_model_path models/")
+    print(f"    --config_path {recommend_config} ", end="")
+    print(f"    --checkpoint_path {best_path} ", end="")
+    print(f"    --img_path data/frame_0100.png ", end="")
+    print(f"    --output_folder outputs ", end="")
+    print(f"    --num_output_frames 50 ", end="")
+    print(f"    --pretrained_model_path models")
 
 
 if __name__ == "__main__":
