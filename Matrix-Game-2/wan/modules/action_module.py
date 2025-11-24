@@ -386,16 +386,17 @@ class ActionModule(nn.Module):
             k = self.key_attn_k_norm(k).to(v)
             S = th * tw
             assert S == 880
-            # position embed 
-            if use_rope_keyboard: 
+            # position embed
+            if use_rope_keyboard:
                 B, TS, H, D = q.shape
-                T_ = TS // S 
+                T_ = TS // S
                 q = q.view(B, T_, S, H, D).transpose(1, 2).reshape(B * S, T_, H, D)
                 q, k = apply_rotary_emb(q, k, freqs_cis, start_offset = start_frame,head_first=False)
 
-                k1, k2, k3, k4 = k.shape
-                k = k.expand(S, k2, k3, k4)
-                v = v.expand(S, k2, k3, k4)
+                # k and v have shape [B, T_, H, D], need to expand to [B*S, T_, H, D]
+                # by repeating each batch element S times
+                k = k.unsqueeze(1).expand(B, S, T_, H, D).reshape(B * S, T_, H, D)
+                v = v.unsqueeze(1).expand(B, S, T_, H, D).reshape(B * S, T_, H, D)
 
 
                 if is_causal:

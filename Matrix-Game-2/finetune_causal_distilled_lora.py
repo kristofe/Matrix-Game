@@ -20,6 +20,7 @@ from omegaconf import OmegaConf
 from convert_unreal_data import UnrealDataset
 from einops import rearrange
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+from peft.utils import get_peft_model_state_dict
 
 def normalize_frames(frames):
     """Convert frames from [0, 1] to [-1, 1] for model input."""
@@ -44,7 +45,7 @@ def parse_args():
                         help="Condition only on keyboard; omit mouse inputs during training")
     parser.add_argument("--sequence_length", type=int, default=9,
                         help="Number of frames per training sample (9 recommended)")
-    parser.add_argument("--batch_size", type=int, default=1,
+    parser.add_argument("--batch_size", type=int, default=8,
                         help="Batch size for training")
     parser.add_argument("--num_epochs", type=int, default=10,
                         help="Number of training epochs")
@@ -52,8 +53,8 @@ def parse_args():
                         help="Learning rate")
     parser.add_argument("--save_every", type=int, default=2,
                         help="Save checkpoint every N epochs")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
-                        help="Number of gradient accumulation steps")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
+                        help="Number of gradient accumulation steps (effective batch size)")
 
     # LoRA parameters
     parser.add_argument("--lora_rank", type=int, default=16)
@@ -204,8 +205,8 @@ def main():
     vae = get_wanx_vae_wrapper("models/", torch.float16)
     vae.requires_grad_(False)
     vae.eval()
-    # Keep VAE on CPU to save GPU memory, move to GPU only when encoding
-    vae = vae.to('cpu', torch.float16)
+    # Keep VAE on GPU - we have 90GB VRAM, no need to move it back and forth
+    vae = vae.to(device, torch.float16)
     
     # Initialize Flow Match scheduler
     print("\nInitializing Flow Match scheduler...")
@@ -235,8 +236,10 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
-        pin_memory=True
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
     )
     
     # Initialize optimizer and scheduler
@@ -278,25 +281,18 @@ def main():
                 
                 # Encode frames to latents using VAE
                 with torch.no_grad():
-                    # Move VAE to GPU temporarily
-                    vae = vae.to(device, torch.float16)
-                    
                     # Rearrange for VAE: [B, C, T, H, W]
                     frames_vae = frames.permute(0, 4, 1, 2, 3).to(dtype=torch.float16)
-                    
+
                     # Encode with tiling
                     tiler_kwargs = {"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
                     latents = vae.encode(frames_vae, device=device, **tiler_kwargs)
                     latents = latents.to(device=device, dtype=torch.bfloat16)
-                    
+
                     # Get visual context from CLIP
                     visual_context = vae.clip.encode_video(frames_vae).to(
                         device=device, dtype=torch.bfloat16
                     )
-                    
-                    # Move VAE back to CPU to free GPU memory
-                    vae = vae.to('cpu', torch.float16)
-                    torch.cuda.empty_cache()
                 
                 # Now match actions to latent temporal resolution
                 # VAE compresses time by 4x: 9 video frames -> 3 latent frames (9/4 + 1)
@@ -414,21 +410,9 @@ def main():
                     'lr': f"{lr_scheduler.get_last_lr()[0]:.2e}"
                 })
                 
-                # Aggressive memory cleanup
-                del noisy_latents, noisy_latents_flat, predicted_velocity, target_velocity, target_velocity_flat, loss
-                del latents, latents_flat, visual_context, cond_concat, noise
-                del frames, frames_vae, keyboard, conditional_dict
-                if mouse is not None:
-                    del mouse
-                del keyboard_per_frame
-                if mouse_per_frame is not None:
-                    del mouse_per_frame
-                del keyboard_expanded
-                if 'mouse_expanded' in locals():
-                    del mouse_expanded
-                
-                # Clear cache after every batch to prevent OOM
-                torch.cuda.empty_cache()
+                # Minimal memory cleanup (Python GC will handle most of this)
+                # Only clear cache if we're actually running low on memory
+                # torch.cuda.empty_cache() is slow and unnecessary with 90GB VRAM
                 
             except Exception as e:
                 print(f"\nError in batch {batch_idx}: {e}")
@@ -449,7 +433,7 @@ def main():
                     if 'noisy_latents' in locals():
                         print(f"noisy_latents shape: {noisy_latents.shape}")
                 
-                # Clean up any allocated tensors to prevent memory leaks on error
+                # Only clear cache on error in case there's a memory leak
                 torch.cuda.empty_cache()
                 continue
         
@@ -468,7 +452,7 @@ def main():
             print(f"Saving checkpoint adapter weights to {checkpoint_path}...")
             # Save only adapter weights (can't merge without breaking training state)
             if isinstance(model, PeftModel):
-                adapter_state = model.get_peft_state_dict()
+                adapter_state = get_peft_model_state_dict(model)
                 save_file(adapter_state, checkpoint_path)
                 print(f"  NOTE: This checkpoint contains only LoRA adapter weights.")
                 print(f"  To use for inference, merge with base model first.")
@@ -535,8 +519,6 @@ def main():
                 model.train()
             else:
                 save_file(model.state_dict(), best_path)
-        
-        torch.cuda.empty_cache()
     
     # Save final model
     final_path = os.path.join(args.checkpoint_dir, "causal_distilled_lora_final.safetensors")
@@ -603,6 +585,7 @@ def main():
     print(f"\nTraining info saved to {info_path}")
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE!")
+    print("Make sure that the frame count is a multiple of 3 for the inference script to work.")
     print("=" * 60)
     print(f"\nYou can now run inference with:")
     print(f"python inference.py ", end="")
@@ -611,7 +594,7 @@ def main():
     print(f"    --checkpoint_path {best_path} ", end="")
     print(f"    --img_path data/frame_0100.png ", end="")
     print(f"    --output_folder outputs ", end="")
-    print(f"    --num_output_frames 50 ", end="")
+    print(f"    --num_output_frames 51 ", end="")
     print(f"    --pretrained_model_path models")
 
 
