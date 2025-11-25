@@ -45,7 +45,7 @@ def parse_args():
                         help="Condition only on keyboard; omit mouse inputs during training")
     parser.add_argument("--sequence_length", type=int, default=9,
                         help="Number of frames per training sample (9 recommended)")
-    parser.add_argument("--batch_size", type=int, default=8,
+    parser.add_argument("--batch_size", type=int, default=4,
                         help="Batch size for training")
     parser.add_argument("--num_epochs", type=int, default=10,
                         help="Number of training epochs")
@@ -57,7 +57,7 @@ def parse_args():
                         help="Number of gradient accumulation steps (effective batch size)")
 
     # LoRA parameters
-    parser.add_argument("--lora_rank", type=int, default=16)
+    parser.add_argument("--lora_rank", type=int, default=512)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_strategy", type=str, default="attention_ffn",
