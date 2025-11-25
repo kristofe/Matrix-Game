@@ -62,7 +62,7 @@ def main():
         if not any('--batch_size' in arg for arg in remaining_args):
             remaining_args.extend(['--batch_size', '4'])
         if not any('--gradient_accumulation_steps' in arg for arg in remaining_args):
-            remaining_args.extend(['--gradient_accumulation_steps', '1'])
+            remaining_args.extend(['--gradient_accumulation_steps', '4'])
         if not any('--save_every' in arg for arg in remaining_args):
             remaining_args.extend(['--save_every', '1'])
         if not any('--checkpoint_dir' in arg for arg in remaining_args):

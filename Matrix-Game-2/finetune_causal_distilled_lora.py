@@ -47,20 +47,20 @@ def parse_args():
                         help="Number of frames per training sample (9 recommended)")
     parser.add_argument("--batch_size", type=int, default=4,
                         help="Batch size for training")
-    parser.add_argument("--num_epochs", type=int, default=10,
+    parser.add_argument("--num_epochs", type=int, default=4,
                         help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=1e-5,
+    parser.add_argument("--learning_rate", type=float, default=5e-5,
                         help="Learning rate")
-    parser.add_argument("--save_every", type=int, default=2,
+    parser.add_argument("--save_every", type=int, default=1,
                         help="Save checkpoint every N epochs")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
                         help="Number of gradient accumulation steps (effective batch size)")
 
     # LoRA parameters
-    parser.add_argument("--lora_rank", type=int, default=512)
+    parser.add_argument("--lora_rank", type=int, default=128)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--lora_strategy", type=str, default="attention_ffn",
+    parser.add_argument("--lora_strategy", type=str, default="full",
                        choices=["attention_only", "attention_ffn", "full", "action_focused"])
 
     return parser.parse_args()
@@ -100,6 +100,9 @@ def get_lora_target_modules(strategy):
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Enable cudnn benchmark for faster convolutions
+    torch.backends.cudnn.benchmark = True
     
     print("=" * 60)
     print("FINETUNING CAUSAL DISTILLED MODEL")
@@ -168,6 +171,7 @@ def main():
     
     model = get_peft_model(model, lora_config)
     model = model.to(device, dtype=torch.bfloat16)
+    model = torch.compile(model, mode="default")
     model.train()
     
     # Verify that PEFT has frozen base model parameters and only LoRA adapters are trainable
@@ -236,7 +240,7 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=12,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=4
@@ -356,18 +360,7 @@ def main():
                 }
                 if mouse is not None:
                     conditional_dict["mouse_cond"] = mouse
-                
-                # PEFT wrapper works better with keyword arguments
-                predicted_velocity = model(
-                    noisy_image_or_video=noisy_latents,
-                    conditional_dict=conditional_dict,
-                    timestep=timesteps
-                )
-                
-                # Handle tuple output (model may return (output, logits))
-                if isinstance(predicted_velocity, tuple):
-                    predicted_velocity = predicted_velocity[0]
-                
+
                 # Compute target velocity (use flattened version for scheduler)
                 target_velocity_flat = diffusion_scheduler.training_target(
                     latents_flat,
@@ -376,13 +369,25 @@ def main():
                 )
                 # Reshape back to [B, C, T, H, W]
                 target_velocity = rearrange(target_velocity_flat, '(b t) c h w -> b c t h w', b=batch_size, t=num_latent_frames)
-                
-                # Compute loss
-                loss = torch.nn.functional.mse_loss(
-                    predicted_velocity.float(),
-                    target_velocity.float(),
-                    reduction='mean'
-                )
+
+                # Use autocast for mixed precision forward pass
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    predicted_velocity = model(
+                        noisy_image_or_video=noisy_latents,
+                        conditional_dict=conditional_dict,
+                        timestep=timesteps
+                    )
+
+                    # Handle tuple output (model may return (output, logits))
+                    if isinstance(predicted_velocity, tuple):
+                        predicted_velocity = predicted_velocity[0]
+
+                    # Compute loss
+                    loss = torch.nn.functional.mse_loss(
+                        predicted_velocity,
+                        target_velocity,
+                        reduction='mean'
+                    )
                 
                 # Scale loss for gradient accumulation
                 loss = loss / args.gradient_accumulation_steps

@@ -109,10 +109,34 @@ class UnrealDataset(Dataset):
         mouse_actions = np.zeros((sequence_length, 2)).astype(np.float32)
         return mouse_actions
     
+    def _resizecrop(self, image, th, tw):
+        """
+        Crop image to target aspect ratio (th x tw) before resizing.
+        This matches the preprocessing in inference.py.
+        """
+        w, h = image.size
+        if h / w > th / tw:
+            # Image is too tall - crop height
+            new_w = int(w)
+            new_h = int(new_w * th / tw)
+        else:
+            # Image is too wide - crop width
+            new_h = int(h)
+            new_w = int(new_h * tw / th)
+        # Center crop
+        left = (w - new_w) / 2
+        top = (h - new_h) / 2
+        right = (w + new_w) / 2
+        bottom = (h + new_h) / 2
+        image = image.crop((left, top, right, bottom))
+        return image
+
     def _load_frame(self, frame_path):
         """Load and preprocess a single frame."""
         try:
             image = Image.open(frame_path).convert('RGB')
+            # Crop to target aspect ratio (matching inference.py preprocessing)
+            image = self._resizecrop(image, 352, 640)
             # Resize to expected dimensions (352x640 for the model)
             image = image.resize((640, 352))
             # Convert to tensor and normalize to [0, 1]
