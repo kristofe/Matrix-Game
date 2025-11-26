@@ -21,16 +21,18 @@ from pathlib import Path
 
 
 class NewDataset(Dataset):
-    """Dataset for new steering/throttle format data."""
+    """Dataset for new steering/throttle format data with optional latent caching."""
 
-    def __init__(self, data_dir=None, data_root="/media/kristofe/eight/data/", sequence_length=30, fps=25):
-        # Support both data_dir and data_root for compatibility
-        if data_dir is not None:
-            self.data_root = data_dir
-        else:
-            self.data_root = data_root
+    def __init__(self, data_dir, sequence_length=30, fps=25, cache_latents=True):
+        self.data_root = data_dir
         self.sequence_length = sequence_length
         self.fps = fps
+        self.cache_latents = cache_latents
+
+        # Cache directory for latents
+        self.cache_dir = os.path.join(self.data_root, "cached_latents")
+        if cache_latents:
+            os.makedirs(self.cache_dir, exist_ok=True)
 
         # Find all runs across all session folders
         self.runs = self._find_all_runs()
@@ -43,6 +45,11 @@ class NewDataset(Dataset):
             self.sequences.extend(run_sequences)
 
         print(f"Created {len(self.sequences)} sequences of length {sequence_length}")
+
+        # Check cache status
+        if cache_latents:
+            cached_count = self._count_cached_sequences()
+            print(f"Latent cache: {cached_count}/{len(self.sequences)} sequences cached")
 
     def _find_all_runs(self):
         """Find all Run_XXXXXX folders across all session folders."""
@@ -136,6 +143,42 @@ class NewDataset(Dataset):
                 })
 
         return sequences
+
+    def _get_cache_path(self, idx):
+        """Get cache file path for a sequence index."""
+        seq_info = self.sequences[idx]
+        run_name = seq_info['run_path'].name
+        start_idx = seq_info['start_idx']
+        end_idx = seq_info['end_idx']
+        return os.path.join(self.cache_dir, f"{run_name}_seq_{start_idx:06d}_{end_idx:06d}.pt")
+
+    def _count_cached_sequences(self):
+        """Count how many sequences have cached latents."""
+        count = 0
+        for idx in range(len(self.sequences)):
+            if os.path.exists(self._get_cache_path(idx)):
+                count += 1
+        return count
+
+    def has_cached_latents(self, idx):
+        """Check if latents are cached for a sequence."""
+        return os.path.exists(self._get_cache_path(idx))
+
+    def load_cached_latents(self, idx):
+        """Load cached latents for a sequence."""
+        cache_path = self._get_cache_path(idx)
+        if os.path.exists(cache_path):
+            return torch.load(cache_path, weights_only=True)
+        return None
+
+    def save_cached_latents(self, idx, latents, visual_context):
+        """Save latents and CLIP embeddings to cache."""
+        cache_path = self._get_cache_path(idx)
+        cache_data = {
+            'latents': latents.cpu(),
+            'visual_context': visual_context.cpu(),
+        }
+        torch.save(cache_data, cache_path)
 
     def _actions_to_wasd(self, steering, throttle, brake=0.0):
         """
@@ -234,21 +277,37 @@ class NewDataset(Dataset):
             dtype=torch.float32
         )  # (T, 2)
 
-        return {
+        result = {
             'video_frames': video_frames,
             'keyboard_actions': keyboard_actions,
             'mouse_actions': mouse_actions,
+            'sequence_idx': idx,  # For caching
             'run_path': str(seq_info['run_path'])  # For debugging
         }
 
+        # Load cached latents if available
+        if self.cache_latents:
+            cached = self.load_cached_latents(idx)
+            if cached is not None:
+                result['latents'] = cached['latents']
+                result['visual_context'] = cached['visual_context']
+                result['cached'] = True
+            else:
+                # Use empty tensors as placeholders - training will compute actual values
+                result['latents'] = torch.empty(0)
+                result['visual_context'] = torch.empty(0)
+                result['cached'] = False
 
-def test_dataset():
+        return result
+
+
+def test_dataset(data_dir="/media/kristofe/eight/data/"):
     """Test the dataset to make sure it works."""
     print("Testing NewDataset...")
     print("=" * 60)
 
     dataset = NewDataset(
-        data_root="/media/kristofe/eight/data/",
+        data_dir=data_dir,
         sequence_length=30
     )
 

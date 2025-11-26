@@ -22,6 +22,39 @@ from einops import rearrange
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from peft.utils import get_peft_model_state_dict
 
+
+def latent_cache_collate_fn(batch):
+    """Custom collate function that handles mixed cached/uncached batches."""
+    # Check if all items are cached
+    all_cached = all(item.get('cached', False) for item in batch)
+
+    # Build result dict with standard collation for most keys
+    result = {}
+
+    # Keys that should always be collated normally
+    standard_keys = ['video_frames', 'keyboard_actions', 'mouse_actions', 'sequence_idx']
+    for key in standard_keys:
+        if key in batch[0]:
+            values = [item[key] for item in batch]
+            if isinstance(values[0], torch.Tensor):
+                result[key] = torch.stack(values)
+            else:
+                result[key] = values
+
+    # Handle cached flag
+    result['cached'] = torch.tensor([item.get('cached', False) for item in batch])
+
+    # Only collate latents/visual_context if ALL items are cached
+    if all_cached and 'latents' in batch[0] and batch[0]['latents'].numel() > 0:
+        result['latents'] = torch.stack([item['latents'] for item in batch])
+        result['visual_context'] = torch.stack([item['visual_context'] for item in batch])
+
+    # Keep run_path for debugging if present
+    if 'run_path' in batch[0]:
+        result['run_path'] = [item['run_path'] for item in batch]
+
+    return result
+
 def normalize_frames(frames):
     """Convert frames from [0, 1] to [-1, 1] for model input."""
     return frames * 2.0 - 1.0
@@ -171,7 +204,8 @@ def main():
     
     model = get_peft_model(model, lora_config)
     model = model.to(device, dtype=torch.bfloat16)
-    model = torch.compile(model, mode="default")
+    # torch.compile disabled - too many graph breaks from einops/dynamic shapes
+    # provides minimal benefit with this model architecture
     model.train()
     
     # Verify that PEFT has frozen base model parameters and only LoRA adapters are trainable
@@ -226,7 +260,8 @@ def main():
     dataset = UnrealDataset(
         data_dir=args.data_dir,
         sequence_length=args.sequence_length,
-        fps=25
+        fps=25,
+        cache_latents=True  # Enable latent caching for faster subsequent epochs
     )
     
     if len(dataset) == 0:
@@ -243,7 +278,8 @@ def main():
         num_workers=12,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=4
+        prefetch_factor=4,
+        collate_fn=latent_cache_collate_fn  # Handle mixed cached/uncached batches
     )
     
     # Initialize optimizer and scheduler
@@ -258,6 +294,15 @@ def main():
     print("\n" + "=" * 60)
     print("STARTING TRAINING")
     print("=" * 60)
+
+    # Check cache status
+    if hasattr(dataset, '_count_cached_sequences'):
+        cached = dataset._count_cached_sequences()
+        total = len(dataset)
+        if cached < total:
+            print(f"Note: {total - cached} sequences need latent encoding (will be cached during first epoch)")
+        else:
+            print(f"All {total} sequences have cached latents - training will be faster!")
     
     global_step = 0
     best_loss = float('inf')
@@ -279,24 +324,47 @@ def main():
                 if args.model_variant == "gta_drive":
                     # keyboard_per_frame layout is [W, A, S, D]; select W and S
                     keyboard_per_frame = keyboard_per_frame[..., [0, 2]]  # [B, T, 2]
-                
-                # Normalize frames to [-1, 1]
-                frames = normalize_frames(frames)
-                
-                # Encode frames to latents using VAE
-                with torch.no_grad():
-                    # Rearrange for VAE: [B, C, T, H, W]
-                    frames_vae = frames.permute(0, 4, 1, 2, 3).to(dtype=torch.float16)
 
-                    # Encode with tiling
-                    tiler_kwargs = {"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
-                    latents = vae.encode(frames_vae, device=device, **tiler_kwargs)
-                    latents = latents.to(device=device, dtype=torch.bfloat16)
+                # Check if we have cached latents (all items in batch must be cached)
+                # The custom collate only adds 'latents' key if all items are cached
+                use_cache = 'latents' in batch
 
-                    # Get visual context from CLIP
-                    visual_context = vae.clip.encode_video(frames_vae).to(
-                        device=device, dtype=torch.bfloat16
-                    )
+                if use_cache:
+                    # Use cached latents and visual context
+                    latents = batch['latents'].to(device=device, dtype=torch.bfloat16)
+                    visual_context = batch['visual_context'].to(device=device, dtype=torch.bfloat16)
+                else:
+                    # Normalize frames to [-1, 1]
+                    frames_norm = normalize_frames(frames)
+
+                    # Encode frames to latents using VAE
+                    with torch.no_grad():
+                        # Rearrange for VAE: [B, C, T, H, W]
+                        frames_vae = frames_norm.permute(0, 4, 1, 2, 3).to(dtype=torch.float16)
+
+                        # Encode with tiling
+                        tiler_kwargs = {"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
+                        latents = vae.encode(frames_vae, device=device, **tiler_kwargs)
+                        latents = latents.to(device=device, dtype=torch.bfloat16)
+
+                        # Get visual context from CLIP
+                        visual_context = vae.clip.encode_video(frames_vae).to(
+                            device=device, dtype=torch.bfloat16
+                        )
+
+                    # Cache the latents for future epochs
+                    if hasattr(dataset, 'save_cached_latents'):
+                        sequence_indices = batch['sequence_idx']
+                        for i, seq_idx in enumerate(sequence_indices):
+                            # Handle both tensor and int cases
+                            idx = seq_idx.item() if isinstance(seq_idx, torch.Tensor) else seq_idx
+                            if not dataset.has_cached_latents(idx):
+                                # Save without batch dimension - DataLoader will add it back
+                                dataset.save_cached_latents(
+                                    idx,
+                                    latents[i],  # [C, T, H, W] not [1, C, T, H, W]
+                                    visual_context[i]  # [T, D] not [1, T, D]
+                                )
                 
                 # Now match actions to latent temporal resolution
                 # VAE compresses time by 4x: 9 video frames -> 3 latent frames (9/4 + 1)

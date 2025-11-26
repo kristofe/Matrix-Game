@@ -11,25 +11,37 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 import glob
+import hashlib
 
 class UnrealDataset(Dataset):
-    """Dataset for Unreal Engine demo data."""
-    
-    def __init__(self, data_dir="data", sequence_length=30, fps=25):
+    """Dataset for Unreal Engine demo data with optional latent caching."""
+
+    def __init__(self, data_dir="data", sequence_length=30, fps=25, cache_latents=True):
         self.data_dir = data_dir
         self.sequence_length = sequence_length
         self.fps = fps
-        
+        self.cache_latents = cache_latents
+
+        # Cache directory for latents
+        self.cache_dir = os.path.join(data_dir, "cached_latents")
+        if cache_latents:
+            os.makedirs(self.cache_dir, exist_ok=True)
+
         # Load CSV data
         self.csv_data = self._load_csv_data()
-        
+
         # Get all frame files
         self.frame_files = sorted(glob.glob(os.path.join(data_dir, "frame_*.png")))
         print(f"Found {len(self.frame_files)} frames")
-        
+
         # Create sequences
         self.sequences = self._create_sequences()
         print(f"Created {len(self.sequences)} sequences of length {sequence_length}")
+
+        # Check cache status
+        if cache_latents:
+            cached_count = self._count_cached_sequences()
+            print(f"Latent cache: {cached_count}/{len(self.sequences)} sequences cached")
     
     def _load_csv_data(self):
         """Load and parse the CSV input data."""
@@ -53,14 +65,47 @@ class UnrealDataset(Dataset):
         """Create sequences of frames for training."""
         sequences = []
         max_frames = len(self.frame_files)
-        
+
         # Create overlapping sequences
         for start_idx in range(0, max_frames - self.sequence_length + 1, self.sequence_length // 2):
             end_idx = start_idx + self.sequence_length
             if end_idx <= max_frames:
                 sequences.append((start_idx, end_idx))
-        
+
         return sequences
+
+    def _get_cache_path(self, idx):
+        """Get cache file path for a sequence index."""
+        start_idx, end_idx = self.sequences[idx]
+        return os.path.join(self.cache_dir, f"seq_{start_idx:06d}_{end_idx:06d}.pt")
+
+    def _count_cached_sequences(self):
+        """Count how many sequences have cached latents."""
+        count = 0
+        for idx in range(len(self.sequences)):
+            if os.path.exists(self._get_cache_path(idx)):
+                count += 1
+        return count
+
+    def has_cached_latents(self, idx):
+        """Check if latents are cached for a sequence."""
+        return os.path.exists(self._get_cache_path(idx))
+
+    def load_cached_latents(self, idx):
+        """Load cached latents for a sequence."""
+        cache_path = self._get_cache_path(idx)
+        if os.path.exists(cache_path):
+            return torch.load(cache_path, weights_only=True)
+        return None
+
+    def save_cached_latents(self, idx, latents, visual_context):
+        """Save latents and CLIP embeddings to cache."""
+        cache_path = self._get_cache_path(idx)
+        cache_data = {
+            'latents': latents.cpu(),
+            'visual_context': visual_context.cpu(),
+        }
+        torch.save(cache_data, cache_path)
     
     def _key_to_universal_format(self, key):
         """
@@ -152,42 +197,58 @@ class UnrealDataset(Dataset):
     
     def __getitem__(self, idx):
         start_idx, end_idx = self.sequences[idx]
-        
+
         # Load video frames
         video_frames = []
         keyboard_actions = []
-        
+
         for i in range(start_idx, end_idx):
             # Load frame
             frame_path = self.frame_files[i]
             frame = self._load_frame(frame_path)
             video_frames.append(frame)
-            
+
             # Get keyboard action for this frame
             frame_num = i + 1  # Frame numbers start from 1
             if frame_num in self.csv_data:
                 key = self.csv_data[frame_num]['key']
             else:
                 key = "="  # No input if not found
-            
+
             keyboard = self._key_to_universal_format(key)
             keyboard_actions.append(keyboard)
-        
+
         # Convert to tensors
         video_frames = torch.stack(video_frames)  # (T, H, W, C)
         keyboard_actions = torch.tensor(keyboard_actions, dtype=torch.float32)  # (T, 4)
-        
+
         # Generate dummy mouse actions
         mouse_actions = torch.tensor(
-            self._get_mouse_actions(len(video_frames)), 
+            self._get_mouse_actions(len(video_frames)),
             dtype=torch.float32
         )  # (T, 2)
-        
-        return {
+
+        result = {
             'video_frames': video_frames,
             'keyboard_actions': keyboard_actions,
-            'mouse_actions': mouse_actions
+            'mouse_actions': mouse_actions,
+            'sequence_idx': idx,  # For caching
         }
+
+        # Load cached latents if available
+        if self.cache_latents:
+            cached = self.load_cached_latents(idx)
+            if cached is not None:
+                result['latents'] = cached['latents']
+                result['visual_context'] = cached['visual_context']
+                result['cached'] = True
+            else:
+                # Use empty tensors as placeholders - training will compute actual values
+                result['latents'] = torch.empty(0)
+                result['visual_context'] = torch.empty(0)
+                result['cached'] = False
+
+        return result
 
 def test_dataset():
     """Test the dataset to make sure it works."""
