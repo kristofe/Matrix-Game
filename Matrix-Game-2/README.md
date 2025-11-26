@@ -34,7 +34,7 @@ pip install -r requirements.txt
 python setup.py develop
 ```
 
-install flash attn
+MAX_JOBS=16 install flash attn
 ```
 pip install flash-attn --no-build-isolation
 ```
