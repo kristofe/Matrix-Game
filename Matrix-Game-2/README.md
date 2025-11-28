@@ -36,7 +36,7 @@ python setup.py develop
 
 install flash attn
 ```
-pip install flash-attn --no-build-isolation
+MAX_JOBS=16 pip install flash-attn --no-build-isolation
 ```
 
 install apex
