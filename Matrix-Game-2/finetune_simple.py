@@ -129,6 +129,49 @@ def main():
   dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=9)
   dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
+  # 1. Grab one batch
+  batch = next(iter(dataloader))
+  # 2. Print shapes
+  print(f"video_frames: {batch['video_frames'].shape}")      # expect [2, 9, 352, 640, 3]
+  print(f"keyboard_actions: {batch['keyboard_actions'].shape}")  # expect [2, 9, 2]
+  print(f"mouse_actions: {batch['mouse_actions'].shape}")        # expect [2, 9, 2]
+  # 3. Check value ranges
+  print(f"frames min/max: {batch['video_frames'].min():.3f} / {batch['video_frames'].max():.3f}")  # expect 0-1
+  print(f"keyboard min/max: {batch['keyboard_actions'].min():.3f} / {batch['keyboard_actions'].max():.3f}")  # expect 0-1
+  print(f"mouse (steering) range: {batch['mouse_actions'][:,:,1].min():.3f} / {batch['mouse_actions'][:,:,1].max():.3f}")  # expect -1 to 1
+
+  # 4. Save first frame to verify visually
+  first_frame = (batch['video_frames'][0, 0] * 255).byte().numpy()
+  Image.fromarray(first_frame).save("test_frame.png")
+  print("Saved test_frame.png - check it looks correct")
+
+  '''
+      # 1. Grab one batch
+      batch = next(iter(dataloader))
+
+      # 2. Print shapes
+      print(f"video_frames: {batch['video_frames'].shape}")      # expect [2, 9, 352, 640, 3]
+      print(f"keyboard_actions: {batch['keyboard_actions'].shape}")  # expect [2, 9, 2]
+      print(f"mouse_actions: {batch['mouse_actions'].shape}")        # expect [2, 9, 2]
+
+      # 3. Check value ranges
+      print(f"frames min/max: {batch['video_frames'].min():.3f} / {batch['video_frames'].max():.3f}")  # expect 0-1
+      print(f"keyboard min/max: {batch['keyboard_actions'].min():.3f} / {batch['keyboard_actions'].max():.3f}")  # expect 0-1
+      print(f"mouse (steering) range: {batch['mouse_actions'][:,:,1].min():.3f} / {batch['mouse_actions'][:,:,1].max():.3f}")  # expect -1 to 1
+
+      # 4. Save first frame to verify visually
+      first_frame = (batch['video_frames'][0, 0] * 255).byte().numpy()
+      Image.fromarray(first_frame).save("test_frame.png")
+      print("Saved test_frame.png - check it looks correct")
+
+  This will confirm:
+  - Batching works
+  - Shapes are correct
+  - Values are in expected ranges
+  - Frames load correctly (visual check)
+
+  '''
+
 if __name__ == "__main__":
   main()
 
