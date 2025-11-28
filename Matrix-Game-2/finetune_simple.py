@@ -19,7 +19,12 @@ class SimpleDataset(Dataset):
       # Find all runs
       self.runs = []
       for run in sorted(glob.glob(os.path.join(data_dir, "*/Run_*"))):
-          frames = sorted(glob.glob(os.path.join(run, "frame_*.png")))
+          # Get frames and sort numerically by frame number
+          frame_pattern = os.path.join(run, "frame_*.png")
+          frames = glob.glob(frame_pattern)
+          # Sort by extracting frame number from filename (e.g., frame_0001.png -> 1)
+          frames = sorted(frames, key=lambda x: int(os.path.basename(x).split('_')[1].split('.')[0]))
+
           if len(frames) >= sequence_length:
               self.runs.append({
                   'path': run,
@@ -56,6 +61,33 @@ class SimpleDataset(Dataset):
       img = img.resize((640, 352))
       return torch.from_numpy(np.array(img)).float() / 255.0
 
+  def _to_gta_drive_format(self, steering, throttle, brake=0.0):
+      """
+      Convert steering/throttle/brake to gta_drive format.
+
+      For gta_drive mode (see utils/conditions.py):
+        - keyboard_condition: [forward, back] where forward=throttle, back=brake
+        - mouse_condition: [vertical, horizontal] where horizontal=steering
+
+      Args:
+          steering: -1 (full left) to 1 (full right) - maps to mouse horizontal
+          throttle: 0 to 1 - maps to keyboard forward
+          brake: 0 to 1 - maps to keyboard back
+
+      Returns:
+          keyboard: [forward, back]
+          mouse: [vertical, horizontal]
+      """
+      keyboard = [
+          max(0.0, min(1.0, throttle)),  # forward
+          max(0.0, min(1.0, brake))       # back
+      ]
+      mouse = [
+          0.0,      # vertical (not used for driving)
+          steering  # horizontal (steering = camera rotation)
+      ]
+      return keyboard, mouse
+
   def __len__(self):
       return len(self.sequences)
 
@@ -64,17 +96,28 @@ class SimpleDataset(Dataset):
       run = self.runs[run_idx]
 
       frames = []
-      actions = []
+      keyboard_actions = []
+      mouse_actions = []
 
       for i in range(self.sequence_length):
           frame_idx = start + i
           frames.append(self._load_frame(run['frames'][frame_idx]))
+
+          # Get raw inputs for this frame
           inp = run['inputs'].get(frame_idx, {'steering': 0.0, 'throttle': 0.0})
-          actions.append([inp['steering'], inp['throttle']])
+          steering = inp.get('steering', 0.0)
+          throttle = inp.get('throttle', 0.0)
+          brake = inp.get('brake', 0.0)
+
+          # Convert to gta_drive format
+          keyboard, mouse = self._to_gta_drive_format(steering, throttle, brake)
+          keyboard_actions.append(keyboard)
+          mouse_actions.append(mouse)
 
       return {
-          'frames': torch.stack(frames),                          # [9, 352, 640, 3]
-          'actions': torch.tensor(actions, dtype=torch.float32)   # [9, 2]
+          'video_frames': torch.stack(frames),                                      # [T, H, W, C] = [9, 352, 640, 3]
+          'keyboard_actions': torch.tensor(keyboard_actions, dtype=torch.float32),  # [T, 2] = [9, 2] (forward, back)
+          'mouse_actions': torch.tensor(mouse_actions, dtype=torch.float32),        # [T, 2] = [9, 2] (vertical, horizontal/steering)
       }
 
 
