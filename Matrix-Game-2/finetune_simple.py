@@ -59,7 +59,8 @@ class SimpleDataset(Dataset):
       """Load image, resize to 352x640, normalize to [0,1]"""
       img = Image.open(path).convert('RGB')
       img = img.resize((640, 352))
-      return torch.from_numpy(np.array(img)).float() / 255.0
+      arr = torch.from_numpy(np.array(img)).float() / 255.0
+      return arr * 2.0 - 1.0  # Normalize to [-1, 1]
 
   def _to_gta_drive_format(self, steering, throttle, brake=0.0):
       """
@@ -70,7 +71,7 @@ class SimpleDataset(Dataset):
         - mouse_condition: [vertical, horizontal] where horizontal=steering
 
       Args:
-          steering: -1 (full left) to 1 (full right) - maps to mouse horizontal
+          steering: 0 to 0.1
           throttle: 0 to 1 - maps to keyboard forward
           brake: 0 to 1 - maps to keyboard back
 
@@ -79,12 +80,12 @@ class SimpleDataset(Dataset):
           mouse: [vertical, horizontal]
       """
       keyboard = [
-          max(0.0, min(1.0, throttle)),  # forward
-          max(0.0, min(1.0, brake))       # back
+        1.0 if throttle > 0.1 else 0.0,  # forward binary
+        1.0 if brake > 0.1 else 0.0      # back binary
       ]
       mouse = [
           0.0,      # vertical (not used for driving)
-          steering  # horizontal (steering = camera rotation)
+          steering * 0.1 # horizontal (steering = camera rotation)
       ]
       return keyboard, mouse
 
@@ -120,7 +121,30 @@ class SimpleDataset(Dataset):
           'mouse_actions': torch.tensor(mouse_actions, dtype=torch.float32),        # [T, 2] = [9, 2] (vertical, horizontal/steering)
       }
 
+def verify_batch(batch):
+    frames = batch['video_frames']
+    keyboard = batch['keyboard_actions']
+    mouse = batch['mouse_actions']
 
+    print("\n=== Verification ===")
+
+    # 1. Frame range should be [-1, 1]
+    fmin, fmax = frames.min().item(), frames.max().item()
+    print(f"Frame range: min {fmin:.3f}, max {fmax:.3f}")
+
+    # 2 keyboard should be binary 0 or 1
+    unique_keyboard = torch.unique(keyboard).tolist()
+    print(f"Keyboard unique values: {unique_keyboard} (expect [0.0, 1.0])")
+
+    # 3. Mouse horizontal (steering) should be in range [-1, 1]
+    steering = mouse[:, :, 1]
+    smin, smax = steering.min().item(), steering.max().item()
+    print(f"Steering range: min {smin:.3f}, max {smax:.3f}")
+
+    # 4 Print shapes
+    print(f"Video frames shape: {frames.shape}")        # expect [B, T, H, W, C]
+    print(f"Keyboard actions shape: {keyboard.shape}")  # expect [B, T, 2]
+    print(f"Mouse actions shape: {mouse.shape}")        # expect [B, T, 2]
 
 def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -141,10 +165,11 @@ def main():
   print(f"mouse (steering) range: {batch['mouse_actions'][:,:,1].min():.3f} / {batch['mouse_actions'][:,:,1].max():.3f}")  # expect -1 to 1
 
   # 4. Save first frame to verify visually
-  first_frame = (batch['video_frames'][0, 0] * 255).byte().numpy()
+  first_frame = ((batch['video_frames'][0, 0] + 1)* 127.5).byte().numpy()
   Image.fromarray(first_frame).save("test_frame.png")
   print("Saved test_frame.png - check it looks correct")
 
+  verify_batch(batch)
   '''
       # 1. Grab one batch
       batch = next(iter(dataloader))
