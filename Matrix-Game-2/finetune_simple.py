@@ -173,6 +173,7 @@ def load_model(device):
     return model, vae
 
 
+
 def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
@@ -205,6 +206,26 @@ def main():
   print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
   print(f"VAE parameters: {sum(p.numel() for p in vae.parameters()):,}")
   print("Vae loaded.")
+
+  # Test the VAE
+  print("\nTesting VAE encoding/decoding...")
+  with torch.no_grad():
+    #get frames [B, T, H, W, C] -> [B, C, T, H, W]
+    frames = batch['video_frames'].to(device, dtype=torch.float16)
+    frames = frames.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
+
+    # Encode
+    latents = vae.encode(frames, device=device)
+    print(f"Input frames shape: {frames.shape}")
+    print(f"Latents shape: {latents.shape}") 
+
+    # Decode
+    recon_frames = vae.decode(latents, device=device)
+    print(f"Reconstructed frames shape: {recon_frames.shape}")
+    # Save first reconstructed frame
+    recon_first_frame = ((recon_frames[0, :, 0] + 1) * 127.5).byte().cpu().numpy().transpose(1, 2, 0)
+    Image.fromarray(recon_first_frame).save("recon_test_frame.png")
+    print("Saved recon_test_frame.png - check it looks correct")
   '''
       # 1. Grab one batch
       batch = next(iter(dataloader))
