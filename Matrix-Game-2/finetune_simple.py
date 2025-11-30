@@ -164,7 +164,13 @@ def load_model(device):
 
     model = model.to(device, dtype=torch.bfloat16)
 
-    return model
+    #load vae
+    from wan.vae.wanx_vae import get_wanx_vae_wrapper
+    vae = get_wanx_vae_wrapper("models/", torch.float16)
+    vae.requires_grad_(False)
+    vae.eval()
+    vae = vae.to(device, dtype=torch.float16)
+    return model, vae
 
 
 def main():
@@ -195,8 +201,10 @@ def main():
 
   # Load model
   print("\nLoading model...")
-  model = load_model(device)
+  model, vae = load_model(device)
   print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+  print(f"VAE parameters: {sum(p.numel() for p in vae.parameters()):,}")
+  print("Vae loaded.")
   '''
       # 1. Grab one batch
       batch = next(iter(dataloader))
