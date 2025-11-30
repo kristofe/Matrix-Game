@@ -10,6 +10,9 @@ import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
+from omegaconf import OmegaConf
+from safetensors.torch import load_file
+from utils.wan_wrapper import WanDiffusionWrapper
 
 
 class SimpleDataset(Dataset):
@@ -146,6 +149,24 @@ def verify_batch(batch):
     print(f"Keyboard actions shape: {keyboard.shape}")  # expect [B, T, 2]
     print(f"Mouse actions shape: {mouse.shape}")        # expect [B, T, 2]
 
+def load_model(device):
+    #load config
+    config = OmegaConf.load("configs/inference_yaml/inference_gta_drive.yaml")
+    config.model_kwargs.model_config = "configs/distilled_model/gta_drive"
+
+    #create model
+    model = WanDiffusionWrapper(**config.model_kwargs, is_causal=True)
+
+    #load weights
+    checkpoint = "models/gta_distilled_model/gta_keyboard2dim.safetensors"
+    state_dict = load_file(checkpoint)
+    model.load_state_dict(state_dict, strict=False)
+
+    model = model.to(device, dtype=torch.bfloat16)
+
+    return model
+
+
 def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
@@ -170,6 +191,12 @@ def main():
   print("Saved test_frame.png - check it looks correct")
 
   verify_batch(batch)
+
+
+  # Load model
+  print("\nLoading model...")
+  model = load_model(device)
+  print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
   '''
       # 1. Grab one batch
       batch = next(iter(dataloader))
