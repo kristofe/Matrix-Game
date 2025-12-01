@@ -216,6 +216,8 @@ def main():
 
     # Encode
     latents = vae.encode(frames, device=device)
+    model.model.num_frame_per_block = latents.shape[2]
+
     print(f"Input frames shape: {frames.shape}")
     print(f"Latents shape: {latents.shape}") 
 
@@ -226,6 +228,52 @@ def main():
     recon_first_frame = ((recon_frames[0, :, 0] + 1) * 127.5).byte().cpu().numpy().transpose(1, 2, 0)
     Image.fromarray(recon_first_frame).save("recon_test_frame.png")
     print("Saved recon_test_frame.png - check it looks correct")
+
+    # Test a forward pass through the model
+    print("\nTesting model forward pass...")
+    from utils.scheduler import FlowMatchScheduler
+    scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+
+    with torch.no_grad():
+        # Prepare Conditions
+        keyboard = batch['keyboard_actions'].to(device, dtype=torch.bfloat16) # [B, T, 2]
+        mouse = batch['mouse_actions'].to(device, dtype=torch.bfloat16)       # [B, T, 2]
+        latents = latents.to(dtype=torch.bfloat16)
+
+        # expand actions to match latents spatial dims
+        num_latent_frames = latents.shape[2]
+        num_action_steps = 1 + 4 * (num_latent_frames - 1)
+        keyboard = keyboard[:, :num_action_steps]
+        mouse = mouse[:, :num_action_steps]
+
+        # create cond_concat (mask + latents)
+        mask_cond = torch.zeros_like(latents[:,:4]) # [B, 4, T, H, W]
+        mask_cond[:,:, 0] = 0 # first frame known/conditional
+        cond_concat = torch.cat([mask_cond, latents], dim=1) # [B, 20, T, H, W]
+
+        # get visual context from CLIP
+        visual_context = vae.clip.encode_video(frames).to(device=device, dtype=torch.bfloat16)  # [B, C, T, H, W]
+
+        # add noise
+        noise = torch.randn_like(latents)
+        timestep_scalar = torch.tensor([0.5], device=device, dtype=torch.bfloat16)  # midpoint
+        timestep = torch.full((1, num_latent_frames),0.5, device=device, dtype=torch.bfloat16) # midpoint
+        noisy_latents = scheduler.add_noise(latents, noise, timestep_scalar)
+
+        conditional_dict = {
+            "cond_concat": cond_concat,
+            "visual_context": visual_context,
+            "keyboard_cond": keyboard,
+            "mouse_cond": mouse,
+        }
+        # Forward pass
+        pred = model(
+            noisy_image_or_video=noisy_latents,
+            timestep = timestep,
+            conditional_dict = conditional_dict,
+        )
+        print(f'model output: {len(pred)} tensors, shapes {[p.shape for p in pred]}')
+        print("Forward pass successful.")
   '''
       # 1. Grab one batch
       batch = next(iter(dataloader))
