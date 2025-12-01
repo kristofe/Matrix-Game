@@ -2,6 +2,7 @@
 Simple finetuning script - built from scratch to understand every piece.
 """
 
+from datetime import datetime
 import torch
 import os
 import glob
@@ -13,7 +14,8 @@ from torch.utils.data import Dataset, DataLoader
 from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from utils.wan_wrapper import WanDiffusionWrapper
-
+import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 class SimpleDataset(Dataset):
   def __init__(self, data_dir="/media/kristofe/eight/data", sequence_length=9):
@@ -172,15 +174,62 @@ def load_model(device):
     vae = vae.to(device, dtype=torch.float16)
     return model, vae
 
+def train_step(model, vae, batch, scheduler, optimizer, device):
+    frames = batch['video_frames'].to(device, dtype=torch.float16)
+    frames = frames.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
 
+    with torch.no_grad():
+        latents = vae.encode(frames, device=device).to(dtype=torch.bfloat16)
+        visual_context = vae.clip.encode_video(frames).to(device=device, dtype=torch.bfloat16)
+        model.model.num_frame_per_block = latents.shape[2]
 
-def main():
-  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-  print(f"Using device: {device}")
+    #prepare conditions
+    num_latent_frames = latents.shape[2]
+    num_action_steps = 1 + 4 * (num_latent_frames - 1)
+    keyboard = batch['keyboard_actions'].to(device, dtype=torch.bfloat16)[:, :num_action_steps]
+    mouse = batch['mouse_actions'].to(device, dtype=torch.bfloat16)[:, :num_action_steps]
 
-  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=9)
-  dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    #mask cond
+    mask_cond = torch.ones_like(latents[:,:4])
+    mask_cond[:,:, 0] = 0 # first frame known/conditional
+    cond_concat = torch.cat([mask_cond, latents], dim=1)
 
+    #sample random timestep
+    batch_size = latents.shape[0]
+    t_scalar = torch.rand(1,device=device) *0.9 + 0.05  #avoid 0 and 1
+    t = t_scalar.expand(batch_size)
+    timestep = t.unsqueeze(1).expand(batch_size, num_latent_frames).to(dtype=torch.bfloat16)
+
+    #add noise
+    #per sample timesteps (different noise levels per sample)
+    noise = torch.randn_like(latents)
+    noisy_latents = scheduler.add_noise(latents, noise, t_scalar)
+
+    #forward pass
+    conditional_dict = {
+        "cond_concat": cond_concat,
+        "visual_context": visual_context,
+        "keyboard_cond": keyboard,
+        "mouse_cond": mouse,
+    }
+    flow_pred, pred_x0 = model(
+        noisy_image_or_video=noisy_latents,
+        timestep = timestep,
+        conditional_dict = conditional_dict,
+    )   
+
+    # flow matching loss: predict velocity (latents - noise)
+    target = scheduler.training_target(latents, noise, t_scalar)
+    loss = torch.nn.functional.mse_loss(flow_pred, target)
+
+    #backprop
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()
+
+def test_logic(dataloader, model, vae, scheduler, device):
   # 1. Grab one batch
   batch = next(iter(dataloader))
   # 2. Print shapes
@@ -199,13 +248,6 @@ def main():
 
   verify_batch(batch)
 
-
-  # Load model
-  print("\nLoading model...")
-  model, vae = load_model(device)
-  print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-  print(f"VAE parameters: {sum(p.numel() for p in vae.parameters()):,}")
-  print("Vae loaded.")
 
   # Test the VAE
   print("\nTesting VAE encoding/decoding...")
@@ -231,75 +273,122 @@ def main():
 
     # Test a forward pass through the model
     print("\nTesting model forward pass...")
-    from utils.scheduler import FlowMatchScheduler
-    scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
 
-    with torch.no_grad():
-        # Prepare Conditions
-        keyboard = batch['keyboard_actions'].to(device, dtype=torch.bfloat16) # [B, T, 2]
-        mouse = batch['mouse_actions'].to(device, dtype=torch.bfloat16)       # [B, T, 2]
-        latents = latents.to(dtype=torch.bfloat16)
+    # Prepare Conditions
+    keyboard = batch['keyboard_actions'].to(device, dtype=torch.bfloat16) # [B, T, 2]
+    mouse = batch['mouse_actions'].to(device, dtype=torch.bfloat16)       # [B, T, 2]
+    latents = latents.to(dtype=torch.bfloat16)
 
-        # expand actions to match latents spatial dims
-        num_latent_frames = latents.shape[2]
-        num_action_steps = 1 + 4 * (num_latent_frames - 1)
-        keyboard = keyboard[:, :num_action_steps]
-        mouse = mouse[:, :num_action_steps]
+    # expand actions to match latents spatial dims
+    num_latent_frames = latents.shape[2]
+    num_action_steps = 1 + 4 * (num_latent_frames - 1)
+    keyboard = keyboard[:, :num_action_steps]
+    mouse = mouse[:, :num_action_steps]
 
-        # create cond_concat (mask + latents)
-        mask_cond = torch.zeros_like(latents[:,:4]) # [B, 4, T, H, W]
-        mask_cond[:,:, 0] = 0 # first frame known/conditional
-        cond_concat = torch.cat([mask_cond, latents], dim=1) # [B, 20, T, H, W]
+    # create cond_concat (mask + latents)
+    mask_cond = torch.zeros_like(latents[:,:4]) # [B, 4, T, H, W]
+    mask_cond[:,:, 0] = 0 # first frame known/conditional
+    cond_concat = torch.cat([mask_cond, latents], dim=1) # [B, 20, T, H, W]
 
-        # get visual context from CLIP
-        visual_context = vae.clip.encode_video(frames).to(device=device, dtype=torch.bfloat16)  # [B, C, T, H, W]
+    # get visual context from CLIP
+    visual_context = vae.clip.encode_video(frames).to(device=device, dtype=torch.bfloat16)  # [B, C, T, H, W]
 
-        # add noise
-        noise = torch.randn_like(latents)
-        timestep_scalar = torch.tensor([0.5], device=device, dtype=torch.bfloat16)  # midpoint
-        timestep = torch.full((1, num_latent_frames),0.5, device=device, dtype=torch.bfloat16) # midpoint
-        noisy_latents = scheduler.add_noise(latents, noise, timestep_scalar)
+    # add noise
+    noise = torch.randn_like(latents)
+    timestep_scalar = torch.tensor([0.5], device=device, dtype=torch.bfloat16)  # midpoint
+    timestep = torch.full((1, num_latent_frames),0.5, device=device, dtype=torch.bfloat16) # midpoint
+    noisy_latents = scheduler.add_noise(latents, noise, timestep_scalar)
 
-        conditional_dict = {
-            "cond_concat": cond_concat,
-            "visual_context": visual_context,
-            "keyboard_cond": keyboard,
-            "mouse_cond": mouse,
-        }
-        # Forward pass
-        pred = model(
-            noisy_image_or_video=noisy_latents,
-            timestep = timestep,
-            conditional_dict = conditional_dict,
-        )
-        print(f'model output: {len(pred)} tensors, shapes {[p.shape for p in pred]}')
-        print("Forward pass successful.")
+    conditional_dict = {
+        "cond_concat": cond_concat,
+        "visual_context": visual_context,
+        "keyboard_cond": keyboard,
+        "mouse_cond": mouse,
+    }
+    # Forward pass
+    pred = model(
+        noisy_image_or_video=noisy_latents,
+        timestep = timestep,
+        conditional_dict = conditional_dict,
+    )
+    print(f'model output: {len(pred)} tensors, shapes {[p.shape for p in pred]}')
+    print("Forward pass successful.")
+
+    # Decode the pred_x0 back to video frames.
+    flow_pred, pred_x0 = pred
+    print(f'flow_pred shape: {flow_pred.shape}, pred_x0 shape: {pred_x0.shape}')
+
+    # Decode the latents to frames
+    decoded = vae.decode(pred_x0.to(torch.float16), device=device)
+
+    # Save first decoded frame
+    pred_frame = ((decoded[0, :, 0] + 1) * 127.5).clamp(0, 255).byte().cpu().numpy().transpose(1, 2, 0)
+    Image.fromarray(pred_frame).save("pred_test_frame.png")
+    print("Saved pred_test_frame.png - check it looks correct")
+
+
+
+def overfit_test(model, vae, dataloader, scheduler, device):
+    """Train on single batch - loss should go to near 0"""
+    print("\n=== Overfit Test ===")
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)  # higher LR
+    batch = next(iter(dataloader))
+    
+    for step in range(100):
+        loss = train_step(model, vae, batch, scheduler, optimizer, device)
+        if step % 10 == 0:
+            print(f"Step {step}, Loss: {loss:.6f}")
+    
+    print(f"Final loss: {loss:.6f}")
+    if loss < 0.1:
+        print("PASS: Loss decreased significantly - training is working")
+    else:
+        print("FAIL: Loss did not decrease enough - check training loop")
+    return loss
+
+def main():
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  print(f"Using device: {device}")
+
+  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=9)
+  dataloader = DataLoader(dataset, batch_size=3, shuffle=True)
+  print("\nLoading model...")
+  model, vae = load_model(device)
+  print("Model loaded.")
+
+  print("Creating scheduler...")
+  from utils.scheduler import FlowMatchScheduler
+  scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+
   '''
-      # 1. Grab one batch
-      batch = next(iter(dataloader))
-
-      # 2. Print shapes
-      print(f"video_frames: {batch['video_frames'].shape}")      # expect [2, 9, 352, 640, 3]
-      print(f"keyboard_actions: {batch['keyboard_actions'].shape}")  # expect [2, 9, 2]
-      print(f"mouse_actions: {batch['mouse_actions'].shape}")        # expect [2, 9, 2]
-
-      # 3. Check value ranges
-      print(f"frames min/max: {batch['video_frames'].min():.3f} / {batch['video_frames'].max():.3f}")  # expect 0-1
-      print(f"keyboard min/max: {batch['keyboard_actions'].min():.3f} / {batch['keyboard_actions'].max():.3f}")  # expect 0-1
-      print(f"mouse (steering) range: {batch['mouse_actions'][:,:,1].min():.3f} / {batch['mouse_actions'][:,:,1].max():.3f}")  # expect -1 to 1
-
-      # 4. Save first frame to verify visually
-      first_frame = (batch['video_frames'][0, 0] * 255).byte().numpy()
-      Image.fromarray(first_frame).save("test_frame.png")
-      print("Saved test_frame.png - check it looks correct")
-
-  This will confirm:
-  - Batching works
-  - Shapes are correct
-  - Values are in expected ranges
-  - Frames load correctly (visual check)
-
+  # Run overfit test first
+  overfit_test(model, vae, dataloader, scheduler, device)
+  # Reload fresh model for actual training
+  model, vae = load_model(device)
   '''
+
+  print("\n=== Starting training loop ===")
+  model.train()
+  optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+
+
+  timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+  writer = SummaryWriter(log_dir=f"logs/finetune_simple_{timestamp}")
+  # initialize tqdm progress bar
+  total_steps = 50
+  pbar = tqdm.tqdm(enumerate(dataloader), total=total_steps)  # total steps for demo
+  # run training loop with tqdm progress bar
+  for step, batch in pbar:
+      loss = train_step(model, vae, batch, scheduler, optimizer, device)
+      #update progress bar
+      pbar.set_description(f"Step {step}, Loss: {loss:.6f}")
+      writer.add_scalar("Loss/train", loss, step)
+      if step >= total_steps:  # Just run a few steps for demo
+          break
+  writer.close()
+
+  print("training loop complete.")
 
 if __name__ == "__main__":
   main()
