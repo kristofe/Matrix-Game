@@ -367,6 +367,51 @@ def overfit_test(model, vae, dataloader, scheduler, device):
         print("FAIL: Loss did not decrease enough - check training loop")
     return loss
 
+def generate_video(model, vae, scheduler, initial_frame, keyboard_actions, mouse_actions, device, num_inference_steps=50):
+    '''
+    Generate a 3-second video (90 frames = 23 latent frames) given an initial frame and actions.
+
+    Args:
+        model: the trained diffusion model
+        vae: the VAE for encoding/decoding
+        scheduler: the diffusion scheduler
+        initial_frame: [1, C, H, W] tensor, initial frame in [-1, 1]
+        keyboard_actions: [num_action_steps, 2] tensor (forward, back)
+        mouse_actions: [num_action_steps,  2] tensor, (vertical, horizontal/steering) scaled by 0.1
+        device: torch device
+        num_inference_steps: number of diffusion steps
+    '''
+    num_latent_frames = 23  # for 90 frames at 4x compression   
+    num_action_steps = 1 + 4 * (num_latent_frames - 1) # 89
+
+    #process initial frame if needed
+    if not isinstance(initial_frame, torch.Tensor):
+        from torchvision.transforms import v2
+        transform = v2.Compose([
+            v2.Resize((352, 640),antialias=True),
+            v2.ToTensor(),
+            v2.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]),
+        ])
+        initial_frame = transform(initial_frame).unsqueeze(0)
+    initial_frame.to(device=device, dtype=torch.float16)  # [1, C, H, W]
+
+    # Encode initial frame [B, C, 1, H, W] to latent
+    frame_for_vae = initial_frame.unsqueeze(2)  # [1, C, 1, H, W]
+    padding = torch.zeros(1,3, 4*(num_latent_frames - 1), 352, 640, device=device, dtype=torch.float16)
+    padded_video = torch.cat([frame_for_vae, padding], dim=2)  # [1, C, T_video, H, W]
+
+    with torch.no_grad():
+        latent_cond = vae.encode(padded_video, device=device) # [1, 16, num_latent_frames, 44, 80]
+    
+    # build conditioning
+    mask_cond = torch.zeros_like(latent_cond[:,:4]) 
+    mask_cond[:,:, 0] = 0 # first frame known/conditional
+    cond_concat = torch.cat([mask_cond, latent_cond], dim=1) # [1, 20, T, H, W]
+
+    visual_context = vae.clip.encode_video(frame_for_vae).to(device=device, dtype=torch.bfloat16)
+
+    #prepare actions
+    
 def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
