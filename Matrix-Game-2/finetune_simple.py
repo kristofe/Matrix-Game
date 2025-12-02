@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from utils.wan_wrapper import WanDiffusionWrapper
+from utils.scheduler import FlowMatchScheduler
 import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import lpips
@@ -411,7 +412,97 @@ def generate_video(model, vae, scheduler, initial_frame, keyboard_actions, mouse
     visual_context = vae.clip.encode_video(frame_for_vae).to(device=device, dtype=torch.bfloat16)
 
     #prepare actions
+    keyboard = keyboard_actions[:num_action_steps].unsqueeze(0).to(device, dtype=torch.bfloat16)
+    mouse = mouse_actions[:num_action_steps].unsqueeze(0).to(device, dtype=torch.bfloat16)
+
+    conditional_dict = {
+        "cond_concat": cond_concat.to(dtype=torch.bfloat16),
+        "visual_context": visual_context,
+        "keyboard_cond": keyboard,
+        "mouse_cond": mouse,
+    }
+
+    #initial noise
+    noise = torch.randn(1, 16, num_latent_frames, 44,80, device=device, dtype=torch.bfloat16)
+
+    #denoising loop
+    model.model.num_frame_per_block = num_latent_frames
+    timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
+
+    x = noise
+    for i in tqdm(range(num_inference_steps), desc="Denoising"):
+        t = timesteps[i]
+        t_next = timesteps[i + 1]
+
+        timestep = t.expand(1, num_latent_frames).to(dtype=torch.bfloat16)
+
+        with torch.no_grad():
+            flow_pred, pred_x0 = model(
+                noisy_image_or_video=x,
+                timestep=timestep,
+                conditional_dict=conditional_dict,
+            )
+
+            # why not below?
+            #x = scheduler.step(flow_pred, x, t, t_next)
+            # Euler step: x_next = x + (t_next - t) * flow_pred
+            x = x + (t_next - t) * flow_pred
+
+    # Decode final latents to video frames
+    with torch.no_grad():
+        video = vae.decode(x.to(torch.float16), device=device)  # [1, C, T, H, W]
     
+    #convert to numpy video [T, H, W, C] in [0,255]
+    video = video.squeeze(0).permute(1, 2, 3, 0)  # [T, H, W, C]
+    video = ((video + 1) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8) 
+
+    return video  # [T, H, W, C]
+
+def generate_video(model, vae, scheduler, initial_frame, device, path="output.mp4", process_icon=False):
+    from PIL import Image
+    import numpy as np
+
+    if initial_frame is None:
+        initial_frame = Image.open("demo_images/gta/0000.png")
+
+    # Create constant actions (driving forward)
+    num_action_steps = 89
+    keyboard = torch.zeros(num_action_steps, 2)
+    keyboard[:, 0] = 1  # forward
+    mouse = torch.zeros(num_action_steps, 2)  # straight
+
+    # Generate
+    video = generate_video(model, vae, scheduler, initial_frame, keyboard, mouse, device)
+
+    # Save
+    from utils.visualize import process_video
+    process_video(video, path, None, None, process_icon=process_icon)
+
+def test_generate_video(device):
+    from PIL import Image
+    import numpy as np
+
+    # Load finetuned model
+    model, vae, lpips_fn = load_model(device)
+
+    # Load initial frame
+    img = Image.open("demo_images/gta/0000.png")
+
+    # Create constant actions (driving forward)
+    num_action_steps = 89
+    keyboard = torch.zeros(num_action_steps, 2)
+    keyboard[:, 0] = 1  # forward
+    mouse = torch.zeros(num_action_steps, 2)  # straight
+
+    scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+    # Generate
+    video = generate_video(model, vae, scheduler, img, keyboard, mouse, device)
+
+    # Save
+    from utils.visualize import process_video
+    process_video(video, "output.mp4", None, None, process_icon=False)
+
+
 def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
@@ -423,7 +514,6 @@ def main():
   print("Model loaded.")
 
   print("Creating scheduler...")
-  from utils.scheduler import FlowMatchScheduler
   scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
 
   '''
@@ -460,6 +550,8 @@ def main():
   writer.close()
 
   print("training loop complete.")
+  initial_frame = dataloader.dataset[0]['video_frames'][0,0]  # first frame of first sequence
+  generate_video(model, vae, scheduler, initial_frame, device, path="output.mp4", process_icon=False)
 
 if __name__ == "__main__":
   main()
