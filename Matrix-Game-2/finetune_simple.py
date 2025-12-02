@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 from safetensors.torch import load_file
 from utils.wan_wrapper import WanDiffusionWrapper
 from utils.scheduler import FlowMatchScheduler
-import tqdm
+from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import lpips
 
@@ -196,9 +196,10 @@ def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_
     keyboard = batch['keyboard_actions'].to(device, dtype=torch.bfloat16)[:, :num_action_steps]
     mouse = batch['mouse_actions'].to(device, dtype=torch.bfloat16)[:, :num_action_steps]
 
-    #mask cond
-    mask_cond = torch.ones_like(latents[:,:4])
-    mask_cond[:,:, 0] = 0 # first frame known/conditional
+    #TODO: CONFIRM THIS IS CORRECT
+    #mask cond: 1 = known, 0 = to generate (matching inference.py)
+    mask_cond = torch.zeros_like(latents[:,:4])
+    mask_cond[:,:, 0] = 1  # first frame known/conditional
     cond_concat = torch.cat([mask_cond, latents], dim=1)
 
     #sample random timestep
@@ -387,14 +388,20 @@ def generate_video(model, vae, scheduler, initial_frame, keyboard_actions, mouse
 
     #process initial frame if needed
     if not isinstance(initial_frame, torch.Tensor):
+        # PIL image
         from torchvision.transforms import v2
         transform = v2.Compose([
             v2.Resize((352, 640),antialias=True),
             v2.ToTensor(),
             v2.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]),
         ])
-        initial_frame = transform(initial_frame).unsqueeze(0)
-    initial_frame.to(device=device, dtype=torch.float16)  # [1, C, H, W]
+        initial_frame = transform(initial_frame).unsqueeze(0)  # [1, C, H, W]
+    elif initial_frame.ndim == 3:
+        # [H, W, C] numpy-style tensor from dataset
+        initial_frame = initial_frame.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+        # normalize from [0,1] to [-1,1]
+        initial_frame = initial_frame * 2 - 1
+    initial_frame = initial_frame.to(device=device, dtype=torch.float16)  # [1, C, H, W]
 
     # Encode initial frame [B, C, 1, H, W] to latent
     frame_for_vae = initial_frame.unsqueeze(2)  # [1, C, 1, H, W]
@@ -405,8 +412,8 @@ def generate_video(model, vae, scheduler, initial_frame, keyboard_actions, mouse
         latent_cond = vae.encode(padded_video, device=device) # [1, 16, num_latent_frames, 44, 80]
     
     # build conditioning
-    mask_cond = torch.zeros_like(latent_cond[:,:4]) 
-    mask_cond[:,:, 0] = 0 # first frame known/conditional
+    mask_cond = torch.zeros_like(latent_cond[:,:4])
+    mask_cond[:,:, 0] = 1 # first frame known/conditional
     cond_concat = torch.cat([mask_cond, latent_cond], dim=1) # [1, 20, T, H, W]
 
     visual_context = vae.clip.encode_video(frame_for_vae).to(device=device, dtype=torch.bfloat16)
@@ -458,7 +465,7 @@ def generate_video(model, vae, scheduler, initial_frame, keyboard_actions, mouse
 
     return video  # [T, H, W, C]
 
-def generate_video(model, vae, scheduler, initial_frame, device, path="output.mp4", process_icon=False):
+def generate_video_file(model, vae, scheduler, initial_frame, device, path="output.mp4", process_icon=False):
     from PIL import Image
     import numpy as np
 
@@ -478,15 +485,12 @@ def generate_video(model, vae, scheduler, initial_frame, device, path="output.mp
     from utils.visualize import process_video
     process_video(video, path, None, None, process_icon=process_icon)
 
-def test_generate_video(device):
+def test_generate_video(img, device):
     from PIL import Image
     import numpy as np
 
     # Load finetuned model
     model, vae, lpips_fn = load_model(device)
-
-    # Load initial frame
-    img = Image.open("demo_images/gta/0000.png")
 
     # Create constant actions (driving forward)
     num_action_steps = 89
@@ -527,6 +531,8 @@ def main():
   model.train()
   optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
+  initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
+  test_generate_video(initial_frame, device)
 
   timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
   writer = SummaryWriter(log_dir=f"logs/finetune_simple_{timestamp}")
@@ -549,12 +555,12 @@ def main():
             break
     
     #generate a video at the end of each epoch
-    initial_frame = dataloader.dataset[0]['video_frames'][0,0]  # first frame of first sequence
+    initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
     generate_video(model, vae, scheduler, initial_frame, device, path=f"output_e{epoch}.mp4", process_icon=False)
   writer.close()
 
   print("training loop complete.")
-  initial_frame = dataloader.dataset[0]['video_frames'][0,0]  # first frame of first sequence
+  initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
   generate_video(model, vae, scheduler, initial_frame, device, path="output.mp4", process_icon=False)
 
 if __name__ == "__main__":
