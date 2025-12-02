@@ -16,6 +16,7 @@ from safetensors.torch import load_file
 from utils.wan_wrapper import WanDiffusionWrapper
 import tqdm
 from torch.utils.tensorboard import SummaryWriter
+import lpips
 
 class SimpleDataset(Dataset):
   def __init__(self, data_dir="/media/kristofe/eight/data", sequence_length=9):
@@ -172,9 +173,14 @@ def load_model(device):
     vae.requires_grad_(False)
     vae.eval()
     vae = vae.to(device, dtype=torch.float16)
-    return model, vae
 
-def train_step(model, vae, batch, scheduler, optimizer, device):
+
+    lpips_fn = lpips.LPIPS(net='alex').to(device)
+    lpips_fn.requires_grad_(False)
+    lpips_fn.eval()
+    return model, vae, lpips_fn
+
+def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_weight=0.1):
     frames = batch['video_frames'].to(device, dtype=torch.float16)
     frames = frames.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
 
@@ -220,14 +226,28 @@ def train_step(model, vae, batch, scheduler, optimizer, device):
 
     # flow matching loss: predict velocity (latents - noise)
     target = scheduler.training_target(latents, noise, t_scalar)
-    loss = torch.nn.functional.mse_loss(flow_pred, target)
+    flow_loss = torch.nn.functional.mse_loss(flow_pred, target)
+
+    # LPIPS loss on reconstructed frames
+    with torch.no_grad():
+        pred_frames = vae.decode(pred_x0.to(torch.float16), device=device)
+    
+    # LPIPS expects [B, C, H, W] so we average over frames
+    # frames is already [B, C, T, H, W] from earlier
+    B, C, T, H, W = frames.shape
+    pred_flat = pred_frames.reshape(B * T, C, H, W).float()
+    gt_flat = frames.reshape(B * T, C, H, W).float()
+    lpips_loss = lpips_fn(pred_flat, gt_flat).mean()
+
+    # Combined loss
+    loss = flow_loss + lpips_weight * lpips_loss
 
     #backprop
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item()
+    return flow_loss.item(), lpips_loss.item()
 
 def test_logic(dataloader, model, vae, scheduler, device):
   # 1. Grab one batch
@@ -354,7 +374,7 @@ def main():
   dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=9)
   dataloader = DataLoader(dataset, batch_size=3, shuffle=True)
   print("\nLoading model...")
-  model, vae = load_model(device)
+  model, vae, lpips_fn = load_model(device)
   print("Model loaded.")
 
   print("Creating scheduler...")
@@ -377,15 +397,21 @@ def main():
   writer = SummaryWriter(log_dir=f"logs/finetune_simple_{timestamp}")
   # initialize tqdm progress bar
   total_steps = 50
-  pbar = tqdm.tqdm(enumerate(dataloader), total=total_steps)  # total steps for demo
-  # run training loop with tqdm progress bar
-  for step, batch in pbar:
-      loss = train_step(model, vae, batch, scheduler, optimizer, device)
-      #update progress bar
-      pbar.set_description(f"Step {step}, Loss: {loss:.6f}")
-      writer.add_scalar("Loss/train", loss, step)
-      if step >= total_steps:  # Just run a few steps for demo
-          break
+  curr_step = 0
+  num_epochs = 10
+  for epoch in range(num_epochs):
+    pbar = tqdm.tqdm(enumerate(dataloader), total=total_steps)  # total steps for demo
+    # run training loop with tqdm progress bar
+    for step, batch in pbar:
+        curr_step += 1
+        flow_loss, lpips_loss = train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device)
+        #update progress bar
+        pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}, lpips_loss: {lpips_loss:.6f}")
+        writer.add_scalar("Loss/train", flow_loss + 0.1 * lpips_loss, curr_step)
+        writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
+        writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
+        if step > 0 and step >= total_steps:  # Just run a few steps for demo
+            break
   writer.close()
 
   print("training loop complete.")
