@@ -547,6 +547,10 @@ def main():
         writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
         if step > 0 and step >= total_steps:  # Just run a few steps for demo
             break
+    
+    #generate a video at the end of each epoch
+    initial_frame = dataloader.dataset[0]['video_frames'][0,0]  # first frame of first sequence
+    generate_video(model, vae, scheduler, initial_frame, device, path=f"output_e{epoch}.mp4", process_icon=False)
   writer.close()
 
   print("training loop complete.")
