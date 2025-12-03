@@ -645,7 +645,7 @@ def main():
     # add to tensorboard as a image grid.  Use torchvision.utils.make_grid
     import torchvision.utils as vutils  
     grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2).float() / 255.0, nrow=3)
-    writer.add_image(f"Generated Video Frames Epoch {epoch}", grid, epoch)
+    writer.add_image(f"Generated Video Frames", grid, epoch)
     #save grid as png
     vutils.save_image(grid, f"{output_dir}/generated_frames_epoch{epoch}.png")
 
