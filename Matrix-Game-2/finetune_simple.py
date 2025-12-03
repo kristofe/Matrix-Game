@@ -474,7 +474,7 @@ def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, d
 
     return video
 
-def generate_video_file(model, vae, initial_frame, device, path="output.mp4", process_icon=False):
+def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
     from PIL import Image
     import numpy as np
 
@@ -491,8 +491,11 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4", pr
     video = generate_video(model, vae, initial_frame, keyboard, mouse, device)
 
     # Save
-    from utils.visualize import process_video
-    process_video(video, path, None, None, process_icon=process_icon)
+    import torchvision.io
+    video_tensor = torch.from_numpy(video)  # [T, H, W, C]
+    torchvision.io.write_video(path, video_tensor, fps=25)
+
+    return video
 
 def test_generate_video(img, device):
     from PIL import Image
@@ -514,6 +517,8 @@ def test_generate_video(img, device):
     import torchvision.io
     video_tensor = torch.from_numpy(video)  # [T, H, W, C]
     torchvision.io.write_video("output.mp4", video_tensor, fps=25)
+
+    return video_tensor
 
 
 def main():
@@ -547,7 +552,7 @@ def main():
   timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
   writer = SummaryWriter(log_dir=f"logs/finetune_simple_{timestamp}")
   # initialize tqdm progress bar
-  total_steps = 50
+  total_steps = -1
   curr_step = 0
   num_epochs = 10
   for epoch in range(num_epochs):
@@ -566,12 +571,21 @@ def main():
     
     #generate a video at the end of each epoch
     initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
-    generate_video_file(model, vae, initial_frame, device, path=f"output_e{epoch}.mp4", process_icon=False)
+    vid = generate_video_file(model, vae, initial_frame, device, path=f"output_e{epoch}.mp4")
+    # extract first middle and last frames for tensorboard
+    mid_frame = vid[vid.shape[0] // 2]
+    first_frame = vid[0]
+    last_frame = vid[-1]
+    # add to tensorboard as a image grid.  Use torchvision.utils.make_grid
+    import torchvision.utils as vutils  
+    grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2), nrow=3)
+    writer.add_image(f"Generated Video Frames Epoch {epoch}", grid, epoch)
+
   writer.close()
 
   print("training loop complete.")
   initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
-  generate_video_file(model, vae, initial_frame, device, path="output.mp4", process_icon=False)
+  generate_video_file(model, vae, initial_frame, device, path="output.mp4")
 
 if __name__ == "__main__":
   main()
