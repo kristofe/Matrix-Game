@@ -17,10 +17,11 @@ from utils.wan_wrapper import WanDiffusionWrapper
 from utils.scheduler import FlowMatchScheduler
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from utils.visualize import process_video
 import lpips
 
 class SimpleDataset(Dataset):
-  def __init__(self, data_dir="/media/kristofe/eight/data", sequence_length=9):
+  def __init__(self, data_dir="/media/kristofe/eight/data", sequence_length=9, max_sequences=-1):
       self.sequence_length = sequence_length
 
       # Find all runs
@@ -45,7 +46,12 @@ class SimpleDataset(Dataset):
           num_seq = len(run['frames']) - sequence_length + 1
           for start in range(num_seq):
               self.sequences.append((run_idx, start))
+      
       print(f"Total sequences: {len(self.sequences)}")
+      #only take max_sequences if specified
+      if max_sequences > 0:
+          self.sequences = self.sequences[:max_sequences]
+      print(f"subsampled sequences: {len(self.sequences)}")
 
   def _load_csv(self, csv_path):
       """Load steering/throttle per frame"""
@@ -485,7 +491,13 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
     num_action_steps = 89
     keyboard = torch.zeros(num_action_steps, 2)
     keyboard[:, 0] = 1  # forward
-    mouse = torch.zeros(num_action_steps, 2)  # straight
+
+    # steer in a sloted sine wave
+    steer_amplitude = 0.05
+    steer_frequency = 2 * torch.pi / num_action_steps * 2  # 2 full waves over the video
+    steer_values = steer_amplitude * torch.sin(torch.linspace(0, steer_frequency * num_action_steps, num_action_steps))
+    mouse = torch.zeros(num_action_steps, 2)
+    mouse[:, 1] = steer_values  # horizontal steering
 
     # Generate
     video = generate_video(model, vae, initial_frame, keyboard, mouse, device)
@@ -494,6 +506,26 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
     import torchvision.io
     video_tensor = torch.from_numpy(video)  # [T, H, W, C]
     torchvision.io.write_video(path, video_tensor, fps=25)
+
+    # Build config tuple (keyboard_actions, mouse_actions)
+    config = (
+        keyboard.cpu().numpy(),  # [num_action_steps, 2]
+        mouse.cpu().numpy()      # [num_action_steps, 2]
+    )
+
+    #modify path to include "_with_icons"
+    base, ext = os.path.splitext(path)
+    icons_path = f"{base}_with_icons{ext}"
+
+    process_video(
+        video,                    # [T, H, W, C] uint8
+        icons_path,                     
+        config,                   # tuple of (keyboard, mouse) arrays
+        'assets/images/mouse.png',
+        mouse_scale=0.1,
+        process_icon=True,        # or False to skip icons
+        mode='gta_drive'
+    )
 
     return video
 
@@ -508,7 +540,15 @@ def test_generate_video(img, device):
     num_action_steps = 89
     keyboard = torch.zeros(num_action_steps, 2)
     keyboard[:, 0] = 1  # forward
-    mouse = torch.zeros(num_action_steps, 2)  # straight
+
+    #mouse = torch.zeros(num_action_steps, 2)  # straight
+    # steer in a sloted sine wave
+    steer_amplitude = 0.05
+    steer_frequency = 2 * torch.pi / num_action_steps * 2  # 2 full waves over the video
+    steer_values = steer_amplitude * torch.sin(torch.linspace(0, steer_frequency * num_action_steps, num_action_steps))
+    mouse = torch.zeros(num_action_steps, 2)
+    mouse[:, 1] = steer_values  # horizontal steering
+
 
     # Generate
     video = generate_video(model, vae, img, keyboard, mouse, device)
@@ -518,6 +558,21 @@ def test_generate_video(img, device):
     video_tensor = torch.from_numpy(video)  # [T, H, W, C]
     torchvision.io.write_video("output.mp4", video_tensor, fps=25)
 
+    # Build config tuple (keyboard_actions, mouse_actions)
+    config = (
+        keyboard.cpu().numpy(),  # [num_action_steps, 2]
+        mouse.cpu().numpy()      # [num_action_steps, 2]
+    )
+
+    process_video(
+        video,                    # [T, H, W, C] uint8
+        "output_with_icons.mp4",                     
+        config,                   # tuple of (keyboard, mouse) arrays
+        'assets/images/mouse.png',
+        mouse_scale=0.1,
+        process_icon=True,        # or False to skip icons
+        mode='gta_drive'
+    )
     return video_tensor
 
 
@@ -525,7 +580,7 @@ def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
 
-  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=9)
+  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=9, max_sequences=900)
   dataloader = DataLoader(dataset, batch_size=3, shuffle=True)
   print("\nLoading model...")
   model, vae, lpips_fn = load_model(device)
@@ -547,16 +602,17 @@ def main():
 
   #initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
   #test_generate_video(initial_frame, device)
-  #return
 
   timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
   writer = SummaryWriter(log_dir=f"logs/finetune_simple_{timestamp}")
   # initialize tqdm progress bar
-  total_steps = -1
+  total_steps = 1000
   curr_step = 0
   num_epochs = 10
   for epoch in range(num_epochs):
-    pbar = tqdm(enumerate(dataloader), total=total_steps)  # total steps for demo
+    # min of len(dataloader) and total_steps   
+    prog_bar_steps = len(dataloader) if total_steps < 0 else min(len(dataloader), total_steps)
+    pbar = tqdm(enumerate(dataloader), total=prog_bar_steps)  # total steps for demo    
     # run training loop with tqdm progress bar
     for step, batch in pbar:
         curr_step += 1
@@ -580,6 +636,15 @@ def main():
     import torchvision.utils as vutils  
     grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2), nrow=3)
     writer.add_image(f"Generated Video Frames Epoch {epoch}", grid, epoch)
+
+    # save checkpoint
+    checkpoint_frequency = 1  # save every epoch
+    if (epoch + 1) % checkpoint_frequency == 0:
+        checkpoint_path = f"checkpoints/finetuned_model_epoch{epoch}.safetensors"
+        os.makedirs("checkpoints", exist_ok=True)
+        from safetensors.torch import save_file
+        save_file(model.state_dict(), checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}")
 
   writer.close()
 
