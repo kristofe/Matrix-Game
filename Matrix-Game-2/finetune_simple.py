@@ -188,7 +188,7 @@ def load_model(device):
     lpips_fn.eval()
     return model, vae, lpips_fn
 
-def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_weight=0.1):
+def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_weight=0.3):
     frames = batch['video_frames'].to(device, dtype=torch.float16)
     frames = frames.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
 
