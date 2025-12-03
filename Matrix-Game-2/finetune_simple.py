@@ -566,7 +566,7 @@ def main():
         writer.add_scalar("Loss/train", flow_loss + 0.1 * lpips_loss, curr_step)
         writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
         writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
-        if step > 0 and step >= total_steps:  # Just run a few steps for demo
+        if total_steps > 0 and step >= total_steps:  # Just run a few steps for demo
             break
     
     #generate a video at the end of each epoch
