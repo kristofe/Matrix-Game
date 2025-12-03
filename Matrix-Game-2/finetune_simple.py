@@ -167,6 +167,7 @@ def load_model(device):
     model.load_state_dict(state_dict, strict=False)
 
     model = model.to(device, dtype=torch.bfloat16)
+    model.eval()
 
     #load vae
     from wan.vae.wanx_vae import get_wanx_vae_wrapper
@@ -369,7 +370,7 @@ def overfit_test(model, vae, dataloader, scheduler, device):
         print("FAIL: Loss did not decrease enough - check training loop")
     return loss
 
-def generate_video(model, vae, scheduler, initial_frame, keyboard_actions, mouse_actions, device, num_inference_steps=50):
+def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, device):
     '''
     Generate a 3-second video (90 frames = 23 latent frames) given an initial frame and actions.
 
@@ -383,8 +384,12 @@ def generate_video(model, vae, scheduler, initial_frame, keyboard_actions, mouse
         device: torch device
         num_inference_steps: number of diffusion steps
     '''
-    num_latent_frames = 23  # for 90 frames at 4x compression   
-    num_action_steps = 1 + 4 * (num_latent_frames - 1) # 89
+    from einops import rearrange
+    from pipeline import CausalInferencePipeline
+    from demo_utils.vae_block3 import VAEDecoderWrapper
+
+    num_output_frames = 21  # latent frames = 81 video frames (~3.2s at 25fps)
+    num_action_steps = 1 + 4 * (num_output_frames - 1)  # 81
 
     #process initial frame if needed
     if not isinstance(initial_frame, torch.Tensor):
@@ -397,75 +402,79 @@ def generate_video(model, vae, scheduler, initial_frame, keyboard_actions, mouse
         ])
         initial_frame = transform(initial_frame).unsqueeze(0)  # [1, C, H, W]
     elif initial_frame.ndim == 3:
-        # [H, W, C] numpy-style tensor from dataset
+        # [H, W, C] tensor from dataset - already in [-1, 1]
         initial_frame = initial_frame.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
-        # normalize from [0,1] to [-1,1]
-        initial_frame = initial_frame * 2 - 1
-    initial_frame = initial_frame.to(device=device, dtype=torch.float16)  # [1, C, H, W]
 
-    # Encode initial frame [B, C, 1, H, W] to latent
-    frame_for_vae = initial_frame.unsqueeze(2)  # [1, C, 1, H, W]
-    padding = torch.zeros(1,3, 4*(num_latent_frames - 1), 352, 640, device=device, dtype=torch.float16)
-    padded_video = torch.cat([frame_for_vae, padding], dim=2)  # [1, C, T_video, H, W]
+    weight_dtype = torch.bfloat16
+
+    # Build VAE decoder for pipeline
+    vae_decoder = VAEDecoderWrapper()
+    vae_state_dict = torch.load("models/Wan2.1_VAE.pth", map_location="cpu")
+    decoder_state_dict = {}
+    for key, value in vae_state_dict.items():
+        if 'decoder.' in key or 'conv2' in key:
+            decoder_state_dict[key] = value
+    vae_decoder.load_state_dict(decoder_state_dict)
+    vae_decoder.to(device, torch.float16)
+    vae_decoder.requires_grad_(False)
+    vae_decoder.eval()
+
+    # Load config and build pipeline
+    config = OmegaConf.load("configs/inference_yaml/inference_gta_drive.yaml")
+    pipeline = CausalInferencePipeline(config, generator=model, vae_decoder=vae_decoder)
+    pipeline = pipeline.to(device=device, dtype=weight_dtype)
+    pipeline.vae_decoder.to(torch.float16)
+
+    # Match inference.py exactly: image is [1, C, 1, H, W] in weight_dtype
+    initial_frame = initial_frame.to(device=device, dtype=weight_dtype)
+    image = initial_frame.unsqueeze(2)  # [1, C, 1, H, W]
+
+    # Padding matches image dtype (like zeros_like in inference.py)
+    padding_video = torch.zeros_like(image).repeat(1, 1, 4 * (num_output_frames - 1), 1, 1)
+    img_cond_input = torch.cat([image, padding_video], dim=2)
 
     with torch.no_grad():
-        latent_cond = vae.encode(padded_video, device=device) # [1, 16, num_latent_frames, 44, 80]
-    
-    # build conditioning
-    mask_cond = torch.zeros_like(latent_cond[:,:4])
-    mask_cond[:,:, 0] = 1 # first frame known/conditional
-    cond_concat = torch.cat([mask_cond, latent_cond], dim=1) # [1, 20, T, H, W]
+        tiler_kwargs = {"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
+        img_cond = vae.encode(img_cond_input.to(torch.float16), device=device, **tiler_kwargs).to(device)
 
-    visual_context = vae.clip.encode_video(frame_for_vae).to(device=device, dtype=torch.bfloat16)
+    # Build conditioning like inference.py
+    mask_cond = torch.ones_like(img_cond)
+    mask_cond[:, :, 1:] = 0
+    cond_concat = torch.cat([mask_cond[:, :4], img_cond], dim=1)
+    visual_context = vae.clip.encode_video(image.to(torch.float16))
 
-    #prepare actions
-    keyboard = keyboard_actions[:num_action_steps].unsqueeze(0).to(device, dtype=torch.bfloat16)
-    mouse = mouse_actions[:num_action_steps].unsqueeze(0).to(device, dtype=torch.bfloat16)
+    # Prepare noise and actions
+    sampled_noise = torch.randn(1, 16, num_output_frames, 44, 80, device=device, dtype=weight_dtype)
+
+    keyboard = keyboard_actions[:num_action_steps].unsqueeze(0).to(device, dtype=weight_dtype)
+    mouse = mouse_actions[:num_action_steps].unsqueeze(0).to(device, dtype=weight_dtype)
 
     conditional_dict = {
-        "cond_concat": cond_concat.to(dtype=torch.bfloat16),
-        "visual_context": visual_context,
+        "cond_concat": cond_concat.to(device=device, dtype=weight_dtype),
+        "visual_context": visual_context.to(device=device, dtype=weight_dtype),
         "keyboard_cond": keyboard,
         "mouse_cond": mouse,
     }
 
-    #initial noise
-    noise = torch.randn(1, 16, num_latent_frames, 44,80, device=device, dtype=torch.bfloat16)
-
-    #denoising loop
-    model.model.num_frame_per_block = num_latent_frames
-    timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
-
-    x = noise
-    for i in tqdm(range(num_inference_steps), desc="Denoising"):
-        t = timesteps[i]
-        t_next = timesteps[i + 1]
-
-        timestep = t.expand(1, num_latent_frames).to(dtype=torch.bfloat16)
-
-        with torch.no_grad():
-            flow_pred, pred_x0 = model(
-                noisy_image_or_video=x,
-                timestep=timestep,
-                conditional_dict=conditional_dict,
-            )
-
-            # why not below?
-            #x = scheduler.step(flow_pred, x, t, t_next)
-            # Euler step: x_next = x + (t_next - t) * flow_pred
-            x = x + (t_next - t) * flow_pred
-
-    # Decode final latents to video frames
+    # Run inference using the proper pipeline
     with torch.no_grad():
-        video = vae.decode(x.to(torch.float16), device=device)  # [1, C, T, H, W]
-    
-    #convert to numpy video [T, H, W, C] in [0,255]
-    video = video.squeeze(0).permute(1, 2, 3, 0)  # [T, H, W, C]
-    video = ((video + 1) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8) 
+        videos = pipeline.inference(
+            noise=sampled_noise,
+            conditional_dict=conditional_dict,
+            return_latents=False,
+            mode='gta_drive',
+            profile=False
+        )
 
-    return video  # [T, H, W, C]
+    # Convert output
+    videos_tensor = torch.cat(videos, dim=1)
+    videos = rearrange(videos_tensor, "B T C H W -> B T H W C")
+    video = ((videos.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)[0]
+    video = np.ascontiguousarray(video)
 
-def generate_video_file(model, vae, scheduler, initial_frame, device, path="output.mp4", process_icon=False):
+    return video
+
+def generate_video_file(model, vae, initial_frame, device, path="output.mp4", process_icon=False):
     from PIL import Image
     import numpy as np
 
@@ -479,7 +488,7 @@ def generate_video_file(model, vae, scheduler, initial_frame, device, path="outp
     mouse = torch.zeros(num_action_steps, 2)  # straight
 
     # Generate
-    video = generate_video(model, vae, scheduler, initial_frame, keyboard, mouse, device)
+    video = generate_video(model, vae, initial_frame, keyboard, mouse, device)
 
     # Save
     from utils.visualize import process_video
@@ -498,13 +507,13 @@ def test_generate_video(img, device):
     keyboard[:, 0] = 1  # forward
     mouse = torch.zeros(num_action_steps, 2)  # straight
 
-    scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
     # Generate
-    video = generate_video(model, vae, scheduler, img, keyboard, mouse, device)
+    video = generate_video(model, vae, img, keyboard, mouse, device)
 
-    # Save
-    from utils.visualize import process_video
-    process_video(video, "output.mp4", None, None, process_icon=False)
+    # Save - video is [T, H, W, C] uint8
+    import torchvision.io
+    video_tensor = torch.from_numpy(video)  # [T, H, W, C]
+    torchvision.io.write_video("output.mp4", video_tensor, fps=25)
 
 
 def main():
@@ -531,8 +540,9 @@ def main():
   model.train()
   optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-  initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
-  test_generate_video(initial_frame, device)
+  #initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
+  #test_generate_video(initial_frame, device)
+  #return
 
   timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
   writer = SummaryWriter(log_dir=f"logs/finetune_simple_{timestamp}")
@@ -541,7 +551,7 @@ def main():
   curr_step = 0
   num_epochs = 10
   for epoch in range(num_epochs):
-    pbar = tqdm.tqdm(enumerate(dataloader), total=total_steps)  # total steps for demo
+    pbar = tqdm(enumerate(dataloader), total=total_steps)  # total steps for demo
     # run training loop with tqdm progress bar
     for step, batch in pbar:
         curr_step += 1
@@ -556,12 +566,12 @@ def main():
     
     #generate a video at the end of each epoch
     initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
-    generate_video(model, vae, scheduler, initial_frame, device, path=f"output_e{epoch}.mp4", process_icon=False)
+    generate_video_file(model, vae, initial_frame, device, path=f"output_e{epoch}.mp4", process_icon=False)
   writer.close()
 
   print("training loop complete.")
   initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
-  generate_video(model, vae, scheduler, initial_frame, device, path="output.mp4", process_icon=False)
+  generate_video_file(model, vae, initial_frame, device, path="output.mp4", process_icon=False)
 
 if __name__ == "__main__":
   main()
