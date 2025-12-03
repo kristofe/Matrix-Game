@@ -600,8 +600,9 @@ def main():
   model.train()
   optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-  #initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
+  initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
   #test_generate_video(initial_frame, device)
+  generate_video_file(model, vae, initial_frame, device, path="initial_output.mp4")
 
   timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
   writer = SummaryWriter(log_dir=f"logs/finetune_simple_{timestamp}")
@@ -626,7 +627,11 @@ def main():
             break
     
     #generate a video at the end of each epoch
-    initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
+    # get a random initial squence from the dataloader
+    seq = dataloader.dataset[ np.random.randint(0, len(dataloader.dataset)) ]
+    # get a random initial frame from the sequence
+    random_start = np.random.randint(0, seq['video_frames'].shape[0] - 9)
+    initial_frame = seq['video_frames'][random_start]  # [H, W, C]
     vid = generate_video_file(model, vae, initial_frame, device, path=f"output_e{epoch}.mp4")
     # extract first middle and last frames for tensorboard
     mid_frame = vid[vid.shape[0] // 2]
@@ -636,6 +641,8 @@ def main():
     import torchvision.utils as vutils  
     grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2), nrow=3)
     writer.add_image(f"Generated Video Frames Epoch {epoch}", grid, epoch)
+    #save grid as png
+    vutils.save_image(grid, f"generated_frames_epoch{epoch}.png")
 
     # save checkpoint
     checkpoint_frequency = 1  # save every epoch
@@ -650,7 +657,7 @@ def main():
 
   print("training loop complete.")
   initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
-  generate_video_file(model, vae, initial_frame, device, path="output.mp4")
+  generate_video_file(model, vae, initial_frame, device, path="final_output.mp4")
 
 if __name__ == "__main__":
   main()
