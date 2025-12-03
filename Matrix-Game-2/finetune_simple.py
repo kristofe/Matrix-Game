@@ -586,6 +586,7 @@ def main():
   model, vae, lpips_fn = load_model(device)
   print("Model loaded.")
 
+
   print("Creating scheduler...")
   scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
 
@@ -628,10 +629,7 @@ def main():
     
     #generate a video at the end of each epoch
     # get a random initial squence from the dataloader
-    seq = dataloader.dataset[ np.random.randint(0, len(dataloader.dataset)) ]
-    # get a random initial frame from the sequence
-    random_start = np.random.randint(0, seq['video_frames'].shape[0] - 9)
-    initial_frame = seq['video_frames'][random_start]  # [H, W, C]
+    initial_frame = dataloader.dataset[ np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]  # first frame of 9 frame random sequence [H, W, C]
     vid = generate_video_file(model, vae, initial_frame, device, path=f"output_e{epoch}.mp4")
     # extract first middle and last frames for tensorboard
     mid_frame = vid[vid.shape[0] // 2]
