@@ -255,6 +255,9 @@ def train_step(model, vae, lpips_fn, batch, scheduler, accumulation_steps, devic
 
     loss.backward()
 
+    #clip gradients
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
     #backprop - Nope... doing this outside for gradient accumulation
 
     return loss.item(),flow_loss.item(), lpips_loss.item(), pred_x0 
@@ -507,6 +510,7 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
     import torchvision.io
     video_tensor = torch.from_numpy(video)  # [T, H, W, C]
     torchvision.io.write_video(path, video_tensor, fps=25)
+    no_icons_video = video.copy()
 
     # Build config tuple (keyboard_actions, mouse_actions)
     config = (
@@ -528,7 +532,7 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
         mode='gta_drive'
     )
 
-    return video
+    return no_icons_video, video
 
 def test_generate_video(img, device):
     from PIL import Image
@@ -606,11 +610,25 @@ def main():
   os.makedirs(output_dir, exist_ok=True)    
   print(f"Outputs will be saved to: {output_dir}")
 
+  #freeze action modules - preserve learned action-video mapping
+  frozen_count = 0
+  frozen_modules = ['action_model']
+  for name, param in model.named_parameters():
+      if any(fm in name for fm in frozen_modules):
+          param.requires_grad = False
+          frozen_count += param.numel()
+
+  trainable_params = [p for p in model.parameters() if p.requires_grad]
+  trainable_count = sum(p.numel() for p in trainable_params)
+  total_count = sum(p.numel() for p in model.parameters())
+  print(f"Froze {frozen_count} parameters in action modules.")
+  print(f"Trainable {{trainable_count}} parameters.")
+  print(f"Trainable parameters: {trainable_count} / {total_count} ({100.0 * trainable_count / total_count:.2f}%)")
 
   print("\n=== Starting training loop ===")
   model.train()
   lr = 5e-6
-  optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+  optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
   # Learning rate scheduler with warmup
   warmup_steps = 300 # 1000
@@ -628,8 +646,8 @@ def main():
   reduced_steps = -1
   curr_step = 0
   timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-  hyperparams = {"lr":lr, "batch_size": batch_size, "epochs":num_epochs, "warmup_steps":warmup_steps, "grad_accum_steps":grad_accum_steps}
-  run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}"
+  hyperparams = {"lr":lr, "batch_size": batch_size, "epochs":num_epochs, "warmup_steps":warmup_steps, "grad_accum_steps":grad_accum_steps, "frozen_modules": frozen_modules}
+  run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}_fm={'_'.join(hyperparams['frozen_modules'])}"
   writer = SummaryWriter(log_dir=f"logs/{run_name}")
   for epoch in range(num_epochs):
     # min of len(dataloader) and total_steps   
@@ -650,13 +668,14 @@ def main():
         writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
         writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
         writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
+        writer.add_scalar("LR", optimizer.param_groups[0]['lr'], curr_step)
         if reduced_steps > 0 and step >= reduced_steps:  # Just run a few steps for demo
             break
     
     #generate a video at the end of each epoch
     # get a random initial squence from the dataloader
     initial_frame = dataloader.dataset[ np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]  # first frame of 9 frame random sequence [H, W, C]
-    vid = generate_video_file(model, vae, initial_frame, device, path=f"{output_dir}/output_e{epoch}.mp4")
+    vid, icons_vid = generate_video_file(model, vae, initial_frame, device, path=f"{output_dir}/output_e{epoch}.mp4")
     # extract first middle and last frames for tensorboard
     mid_frame = vid[vid.shape[0] // 2]
     first_frame = vid[0]
