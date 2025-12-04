@@ -1,5 +1,23 @@
 """
-Simple finetuning script - built from scratch to understand every piece.
+DDP-enabled finetuning script for multi-GPU training.
+
+To run on multiple GPUs:
+    torchrun --nproc_per_node=NUM_GPUS finetune_ddp.py
+
+Example with 2 GPUs:
+    torchrun --nproc_per_node=2 finetune_ddp.py
+
+For single GPU (same as finetune_simple.py):
+    python finetune_ddp.py
+
+If you're on a cluster with SLURM:
+    srun --nodes=2 --ntasks-per-node=2 --gpus-per-node=2 \
+        python finetune_ddp.py
+    Requirements for Multi-Node
+        Network: Machines must be able to reach each other on master_port
+        Shared filesystem: All machines need access to the same data path (/media/kristofe/eight/data) - use NFS or copy data to each machine
+        Same code: Identical finetune_ddp.py on all machines
+        Same environment: Same PyTorch version, CUDA, etc.
 """
 
 from datetime import datetime
@@ -687,48 +705,88 @@ def test_generate_video(img, device):
 
 
 def main():
-  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-  print(f"Using device: {device}")
+  # ==========================================================================
+  # DDP SETUP - Initialize distributed training
+  # ==========================================================================
+  # This returns (0, 0, 1) for single GPU, or actual values for multi-GPU
+  rank, local_rank, world_size = setup_distributed()
+
+  # Each process uses its assigned GPU
+  # local_rank maps to the GPU index on this machine (0, 1, 2, ...)
+  device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+  # is_main controls logging/saving - only rank 0 should do these
+  is_main = is_main_process()
+
+  if is_main:
+      print(f"Using device: {device}")
+      print(f"World size (total GPUs): {world_size}")
 
   num_epochs = 10
   # === SEQUENCE LENGTH CONFIG ===
   # Choose latent frames: 3, 5, 9, 13 (higher = better temporal consistency but more memory)
-  latent_frames = 5  # Change this to experiment
+  latent_frames = 3  # Change this to experiment
   seq_config = get_sequence_config(latent_frames)
-  
-  print(f"\n=== Sequence Config ===")
-  print(f"Latent frames: {seq_config['latent_frames']}")
-  print(f"Video frames: {seq_config['video_frames']}")
-  print(f"Batch size: {seq_config['batch_size']}")
-  print(f"Grad accum: {seq_config['grad_accum_steps']}")
-  print(f"Effective batch: {seq_config['effective_batch_size']}")
-  
+
+  if is_main:  # Only print from main process
+      print(f"\n=== Sequence Config ===")
+      print(f"Latent frames: {seq_config['latent_frames']}")
+      print(f"Video frames: {seq_config['video_frames']}")
+      print(f"Batch size per GPU: {seq_config['batch_size']}")
+      print(f"Grad accum: {seq_config['grad_accum_steps']}")
+      # With DDP, effective batch = batch_size * grad_accum * world_size
+      print(f"Effective batch (with {world_size} GPUs): {seq_config['batch_size'] * seq_config['grad_accum_steps'] * world_size}")
+
   batch_size = seq_config['batch_size']
   sequence_length = seq_config['video_frames']
   grad_accum_steps = seq_config['grad_accum_steps']
+  max_sequences = 50  #9000 # Limit dataset size for quicker testing
 
-  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=900)
-  dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-  print("\nLoading model...")
+
+  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
+
+  # ==========================================================================
+  # DDP DATALOADER - Use DistributedSampler for multi-GPU
+  # ==========================================================================
+  # DistributedSampler automatically splits data across GPUs
+  # - GPU 0 gets samples 0, 2, 4, 6, ...
+  # - GPU 1 gets samples 1, 3, 5, 7, ...
+  # This ensures each GPU sees different data each batch
+  if world_size > 1:
+      sampler = DistributedSampler(
+          dataset,
+          num_replicas=world_size,  # Total number of GPUs
+          rank=rank,                 # This GPU's rank
+          shuffle=True,              # Shuffle within each epoch
+      )
+      # When using sampler, set shuffle=False in DataLoader (sampler handles it)
+      dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, sampler=sampler)
+  else:
+      # Single GPU - use regular shuffle
+      dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+  if is_main:
+      print("\nLoading model...")
   model, vae, lpips_fn = load_model(device)
-  print("Model loaded.")
+  if is_main:
+      print("Model loaded.")
 
 
-  print("Creating scheduler...")
+  if is_main:
+      print("Creating scheduler...")
   scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
 
-  '''
-  # Run overfit test first
-  overfit_test(model, vae, dataloader, scheduler, device)
-  # Reload fresh model for actual training
-  model, vae = load_model(device)
-  '''
-
-  # creating output folder
+  # creating output folder (only on main process)
   timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-  output_dir = f"outputs/finetune_simple_{timestamp}"
-  os.makedirs(output_dir, exist_ok=True)    
-  print(f"Outputs will be saved to: {output_dir}")
+  output_dir = f"outputs/finetune_ddp_{timestamp}"
+  if is_main:
+      os.makedirs(output_dir, exist_ok=True)
+      print(f"Outputs will be saved to: {output_dir}")
+
+  # Synchronize all processes before continuing
+  # This ensures the output directory is created before other processes try to use it
+  if world_size > 1:
+      dist.barrier()
 
   #freeze action modules - preserve learned action-video mapping
   frozen_count = 0
@@ -741,48 +799,85 @@ def main():
   trainable_params = [p for p in model.parameters() if p.requires_grad]
   trainable_count = sum(p.numel() for p in trainable_params)
   total_count = sum(p.numel() for p in model.parameters())
-  print(f"Froze {frozen_count} parameters in action modules.")
-  print(f"Trainable {{trainable_count}} parameters.")
-  print(f"Trainable parameters: {trainable_count} / {total_count} ({100.0 * trainable_count / total_count:.2f}%)")
+  if is_main:
+      print(f"Froze {frozen_count} parameters in action modules.")
+      print(f"Trainable parameters: {trainable_count} / {total_count} ({100.0 * trainable_count / total_count:.2f}%)")
 
-  print("\n=== Starting training loop ===")
+  # ==========================================================================
+  # DDP MODEL WRAPPING - Wrap model with DistributedDataParallel
+  # ==========================================================================
+  # DDP wraps your model and handles:
+  # 1. Broadcasting initial weights from rank 0 to all GPUs
+  # 2. Averaging gradients across GPUs during backward pass
+  # 3. Keeping model weights synchronized
+  if world_size > 1:
+      # find_unused_parameters=True is needed if some parameters don't receive gradients
+      # (like our frozen action_model parameters)
+      model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+      if is_main:
+          print(f"Model wrapped with DDP across {world_size} GPUs")
+
+  if is_main:
+      print("\n=== Starting training loop ===")
   model.train()
   lr = 5e-6
   optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
   # Learning rate scheduler with warmup
-  warmup_steps = 300 # 1000
+  warmup_steps = 30 # 1000
   grad_accum_steps = 4
   total_steps = num_epochs * len(dataloader)
   warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
   cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
   lr_scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
-  initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
-  #test_generate_video(initial_frame, device)
-  generate_video_file(model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4")
+  # Generate initial video only on main process
+  if is_main:
+      # For DDP, access underlying model with model.module
+      raw_model = model.module if world_size > 1 else model
+      initial_frame = dataloader.dataset[0]['video_frames'][0]
+      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4")
 
   # initialize tqdm progress bar
   reduced_steps = -1
   curr_step = 0
   timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
   hyperparams = {
-    "lr": lr, 
-    "batch_size": batch_size, 
+    "lr": lr,
+    "batch_size": batch_size,
     "sequence_length": sequence_length,
     "latent_frames": latent_frames,
-    "epochs": num_epochs, 
-    "warmup_steps": warmup_steps, 
+    "epochs": num_epochs,
+    "warmup_steps": warmup_steps,
     "grad_accum_steps": grad_accum_steps,
-    "effective_batch_size": batch_size * grad_accum_steps,
+    "effective_batch_size": batch_size * grad_accum_steps * world_size,  # Include world_size
     "frozen_modules": '_'.join(frozen_modules) if frozen_modules else 'none',
+    "world_size": world_size,  # Track how many GPUs used
   }
-  run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_sl={hyperparams['sequence_length']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}_fm={'_'.join(hyperparams['frozen_modules'])}"
-  writer = SummaryWriter(log_dir=f"logs/{run_name}")
+
+  # TensorBoard writer only on main process
+  writer = None
+  if is_main:
+      run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_sl={hyperparams['sequence_length']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}_fm={'_'.join(hyperparams['frozen_modules'])}_gpus={world_size}"
+      writer = SummaryWriter(log_dir=f"logs/{run_name}")
+
   for epoch in range(num_epochs):
-    # min of len(dataloader) and total_steps   
+    # ==========================================================================
+    # DDP EPOCH SYNC - Set epoch for DistributedSampler
+    # ==========================================================================
+    # This ensures different shuffling each epoch across all GPUs
+    if world_size > 1:
+        dataloader.sampler.set_epoch(epoch)
+
+    # min of len(dataloader) and total_steps
     prog_bar_steps = len(dataloader) if total_steps < 0 else min(len(dataloader), total_steps)
-    pbar = tqdm(enumerate(dataloader), total=prog_bar_steps)  # total steps for demo    
+
+    # Only show progress bar on main process
+    if is_main:
+        pbar = tqdm(enumerate(dataloader), total=prog_bar_steps)
+    else:
+        pbar = enumerate(dataloader)
+
     # run training loop with tqdm progress bar
     for step, batch in pbar:
         curr_step += 1
@@ -792,51 +887,74 @@ def main():
             optimizer.step()
             optimizer.zero_grad()
             lr_scheduler.step()
-        #update progress bar
-        pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}, lpips_loss: {lpips_loss:.6f}")
-        writer.add_scalar("Loss/train", loss, curr_step)
-        writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
-        writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
-        writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
-        writer.add_scalar("LR", optimizer.param_groups[0]['lr'], curr_step)
+
+        # Logging only on main process
+        if is_main:
+            pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}, lpips_loss: {lpips_loss:.6f}")
+            writer.add_scalar("Loss/train", loss, curr_step)
+            writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
+            writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
+            writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
+            writer.add_scalar("LR", optimizer.param_groups[0]['lr'], curr_step)
+
         if reduced_steps > 0 and step >= reduced_steps:  # Just run a few steps for demo
             break
-    
-    #generate a video at the end of each epoch
-    # get a random initial squence from the dataloader
-    initial_frame = dataloader.dataset[ np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]  # first frame of 9 frame random sequence [H, W, C]
-    vid, icons_vid = generate_video_file(model, vae, initial_frame, device, path=f"{output_dir}/output_e{epoch}.mp4")
-    # extract first middle and last frames for tensorboard
-    mid_frame = vid[vid.shape[0] // 2]
-    first_frame = vid[0]
-    last_frame = vid[-1]
-    # add to tensorboard as a image grid.  Use torchvision.utils.make_grid
-    import torchvision.utils as vutils  
-    grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2).float() / 255.0, nrow=3)
-    writer.add_image(f"Generated Video Frames", grid, epoch)
-    #save grid as png
-    vutils.save_image(grid, f"{output_dir}/generated_frames_epoch{epoch}.png")
 
-    # save checkpoint
-    checkpoint_frequency = 1  # save every epoch
-    if (epoch + 1) % checkpoint_frequency == 0:
-        checkpoint_path = f"{output_dir}/finetuned_model_epoch{epoch}.safetensors"
-        os.makedirs("checkpoints", exist_ok=True)
-        from safetensors.torch import save_file
-        save_file(model.state_dict(), checkpoint_path)
-        print(f"Saved checkpoint to {checkpoint_path}")
+    # Video generation and checkpointing only on main process
+    if is_main:
+        # For DDP, access underlying model with model.module
+        raw_model = model.module if world_size > 1 else model
 
-  # final metrics for comparison against other runs.
-  writer.add_hparams(hparam_dict=hyperparams,metric_dict={
-    "final_loss": loss,
-    "final_flow_loss": flow_loss,
-    "final_lpips_loss": lpips_loss,
-  })
-  writer.close()
+        # Generate a video at the end of each epoch
+        initial_frame = dataloader.dataset[np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]
+        vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_e{epoch}.mp4")
 
-  print("training loop complete.")
-  initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
-  generate_video_file(model, vae, initial_frame, device, path=f"{output_dir}/final_output.mp4")
+        # Extract first middle and last frames for tensorboard
+        mid_frame = vid[vid.shape[0] // 2]
+        first_frame = vid[0]
+        last_frame = vid[-1]
+        import torchvision.utils as vutils
+        grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2).float() / 255.0, nrow=3)
+        writer.add_image(f"Generated Video Frames", grid, epoch)
+        vutils.save_image(grid, f"{output_dir}/generated_frames_epoch{epoch}.png")
+
+        # Save checkpoint
+        checkpoint_frequency = 1  # save every epoch
+        if (epoch + 1) % checkpoint_frequency == 0:
+            checkpoint_path = f"{output_dir}/finetuned_model_epoch{epoch}.safetensors"
+            os.makedirs("checkpoints", exist_ok=True)
+            from safetensors.torch import save_file
+            # Save the unwrapped model state dict (not DDP wrapper)
+            save_file(raw_model.state_dict(), checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+
+    # ==========================================================================
+    # DDP SYNC - Synchronize all processes at end of epoch
+    # ==========================================================================
+    # This ensures all GPUs finish the epoch before starting the next
+    if world_size > 1:
+        dist.barrier()
+
+  # Final logging only on main process
+  if is_main:
+      writer.add_hparams(hparam_dict=hyperparams, metric_dict={
+        "final_loss": loss,
+        "final_flow_loss": flow_loss,
+        "final_lpips_loss": lpips_loss,
+      })
+      writer.close()
+
+      print("Training loop complete.")
+      raw_model = model.module if world_size > 1 else model
+      initial_frame = dataloader.dataset[0]['video_frames'][0]
+      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/final_output.mp4")
+
+  # ==========================================================================
+  # DDP CLEANUP - Clean up distributed processes
+  # ==========================================================================
+  cleanup_distributed()
+
+
 if __name__ == "__main__":
   main()
 
