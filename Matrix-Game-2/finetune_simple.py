@@ -17,8 +17,10 @@ from utils.wan_wrapper import WanDiffusionWrapper
 from utils.scheduler import FlowMatchScheduler
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.summary import hparams
 from utils.visualize import process_video
 import lpips
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 class SimpleDataset(Dataset):
   def __init__(self, data_dir="/media/kristofe/eight/data", sequence_length=9, max_sequences=-1):
@@ -188,7 +190,7 @@ def load_model(device):
     lpips_fn.eval()
     return model, vae, lpips_fn
 
-def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_weight=0.3):
+def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_weight=0.6):
     frames = batch['video_frames'].to(device, dtype=torch.float16)
     frames = frames.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
 
@@ -256,7 +258,7 @@ def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_
     loss.backward()
     optimizer.step()
 
-    return flow_loss.item(), lpips_loss.item()
+    return flow_loss.item(), lpips_loss.item(), pred_x0 
 
 def test_logic(dataloader, model, vae, scheduler, device):
   # 1. Grab one batch
@@ -580,8 +582,10 @@ def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
 
+  batch_size = 3
+  num_epochs = 10
   dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=9, max_sequences=900)
-  dataloader = DataLoader(dataset, batch_size=3, shuffle=True)
+  dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
   print("\nLoading model...")
   model, vae, lpips_fn = load_model(device)
   print("Model loaded.")
@@ -606,18 +610,28 @@ def main():
 
   print("\n=== Starting training loop ===")
   model.train()
-  optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+  lr = 5e-6
+  optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+  # Learning rate scheduler with warmup
+  warmup_steps = 300 # 1000
+  total_steps = num_epochs * len(dataloader)
+  warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
+  cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+  lr_scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
   initial_frame = dataloader.dataset[0]['video_frames'][0]  # first frame of first sequence [H, W, C]
   #test_generate_video(initial_frame, device)
   generate_video_file(model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4")
 
-  timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-  writer = SummaryWriter(log_dir=f"logs/finetune_simple_{timestamp}")
   # initialize tqdm progress bar
   total_steps = -1
   curr_step = 0
-  num_epochs = 10
+  timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+  hparams = {"lr":{lr}, "batch_size": {batch_size}, "epochs":{num_epochs}, "warmup_steps":{warmup_steps}}
+  run_name = f"lr={hparams['lr']}_bs={hparams['batch_size']}_ep={hparams['epochs']}_ts={timestamp}_ws={hparams['warmup_steps']}"
+  writer = SummaryWriter(log_dir=f"logs/{run_name}")
+  writer.add_hparams("hparam_dict": hparams, "metric_dict": {})
   for epoch in range(num_epochs):
     # min of len(dataloader) and total_steps   
     prog_bar_steps = len(dataloader) if total_steps < 0 else min(len(dataloader), total_steps)
@@ -625,12 +639,15 @@ def main():
     # run training loop with tqdm progress bar
     for step, batch in pbar:
         curr_step += 1
-        flow_loss, lpips_loss = train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device)
+        flow_loss, lpips_loss, pred_x0 = train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device)
+
+        lr_scheduler.step()
         #update progress bar
         pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}, lpips_loss: {lpips_loss:.6f}")
         writer.add_scalar("Loss/train", flow_loss + 0.1 * lpips_loss, curr_step)
         writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
         writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
+        writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
         if total_steps > 0 and step >= total_steps:  # Just run a few steps for demo
             break
     
@@ -658,6 +675,11 @@ def main():
         save_file(model.state_dict(), checkpoint_path)
         print(f"Saved checkpoint to {checkpoint_path}")
 
+  # final metrics for comparison against other runs.
+  writer.add_hparams("metric_dict": {
+    "final_flow_loss": flow_loss,
+    "final_lpips_loss": lpips_loss,
+  })
   writer.close()
 
   print("training loop complete.")
