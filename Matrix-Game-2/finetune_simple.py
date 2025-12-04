@@ -189,6 +189,42 @@ def load_model(device):
     lpips_fn.eval()
     return model, vae, lpips_fn
 
+def get_sequence_config(latent_frames):
+    """
+    Calculate video frames and recommended batch size for a given number of latent frames.
+    
+    Formula: video_frames = 1 + 4 * (latent_frames - 1)
+    
+    Common configs:
+      latent_frames=3  → video_frames=9   
+      latent_frames=5  → video_frames=17
+      latent_frames=9  → video_frames=33
+      latent_frames=13 → video_frames=49
+      latent_frames=21 → video_frames=81  (3.2s at 25fps)
+    """
+    video_frames = 1 + 4 * (latent_frames - 1)
+    
+    # Memory scales roughly linearly with latent frames
+    # Base: latent_frames=3 uses ~27GB per sample at inference
+    # Training uses more due to gradients
+    memory_estimates = {
+        3: {"batch_size": 3, "grad_accum": 4},   # ~80GB total
+        5: {"batch_size": 2, "grad_accum": 6},   # ~90GB total
+        9: {"batch_size": 1, "grad_accum": 12},  # ~80GB total
+        13: {"batch_size": 1, "grad_accum": 12}, # ~95GB total (might be tight)
+        21: {"batch_size": 1, "grad_accum": 12}, # Won't fit in 96GB
+    }
+    
+    config = memory_estimates.get(latent_frames, {"batch_size": 1, "grad_accum": 8})
+    
+    return {
+        "latent_frames": latent_frames,
+        "video_frames": video_frames,
+        "batch_size": config["batch_size"],
+        "grad_accum_steps": config["grad_accum"],
+        "effective_batch_size": config["batch_size"] * config["grad_accum"],
+    }
+
 def train_step(model, vae, lpips_fn, batch, scheduler, accumulation_steps, device, lpips_weight=0.6):
     frames = batch['video_frames'].to(device, dtype=torch.float16)
     frames = frames.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
@@ -585,9 +621,24 @@ def main():
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
 
-  batch_size = 3
   num_epochs = 10
-  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=9, max_sequences=900)
+  # === SEQUENCE LENGTH CONFIG ===
+  # Choose latent frames: 3, 5, 9, 13 (higher = better temporal consistency but more memory)
+  latent_frames = 5  # Change this to experiment
+  seq_config = get_sequence_config(latent_frames)
+  
+  print(f"\n=== Sequence Config ===")
+  print(f"Latent frames: {seq_config['latent_frames']}")
+  print(f"Video frames: {seq_config['video_frames']}")
+  print(f"Batch size: {seq_config['batch_size']}")
+  print(f"Grad accum: {seq_config['grad_accum_steps']}")
+  print(f"Effective batch: {seq_config['effective_batch_size']}")
+  
+  batch_size = seq_config['batch_size']
+  sequence_length = seq_config['video_frames']
+  grad_accum_steps = seq_config['grad_accum_steps']
+
+  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=900)
   dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
   print("\nLoading model...")
   model, vae, lpips_fn = load_model(device)
@@ -645,8 +696,18 @@ def main():
   # initialize tqdm progress bar
   reduced_steps = -1
   curr_step = 0
-  timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-  hyperparams = {"lr":lr, "batch_size": batch_size, "epochs":num_epochs, "warmup_steps":warmup_steps, "grad_accum_steps":grad_accum_steps, "frozen_modules": frozen_modules}
+  timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
+  hyperparams = {
+    "lr": lr, 
+    "batch_size": batch_size, 
+    "sequence_length": sequence_length,
+    "latent_frames": latent_frames,
+    "epochs": num_epochs, 
+    "warmup_steps": warmup_steps, 
+    "grad_accum_steps": grad_accum_steps,
+    "effective_batch_size": batch_size * grad_accum_steps,
+    "frozen_modules": frozen_modules
+  }
   run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}_fm={'_'.join(hyperparams['frozen_modules'])}"
   writer = SummaryWriter(log_dir=f"logs/{run_name}")
   for epoch in range(num_epochs):
