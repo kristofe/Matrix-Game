@@ -17,7 +17,6 @@ from utils.wan_wrapper import WanDiffusionWrapper
 from utils.scheduler import FlowMatchScheduler
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.tensorboard.summary import hparams
 from utils.visualize import process_video
 import lpips
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
@@ -190,7 +189,7 @@ def load_model(device):
     lpips_fn.eval()
     return model, vae, lpips_fn
 
-def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_weight=0.6):
+def train_step(model, vae, lpips_fn, batch, scheduler, accumulation_steps, device, lpips_weight=0.6):
     frames = batch['video_frames'].to(device, dtype=torch.float16)
     frames = frames.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
 
@@ -252,13 +251,13 @@ def train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device, lpips_
 
     # Combined loss
     loss = flow_loss + lpips_weight * lpips_loss
+    loss = loss / accumulation_steps  # normalize for gradient accumulation
 
-    #backprop
-    optimizer.zero_grad()
     loss.backward()
-    optimizer.step()
 
-    return flow_loss.item(), lpips_loss.item(), pred_x0 
+    #backprop - Nope... doing this outside for gradient accumulation
+
+    return loss.item(),flow_loss.item(), lpips_loss.item(), pred_x0 
 
 def test_logic(dataloader, model, vae, scheduler, device):
   # 1. Grab one batch
@@ -615,6 +614,7 @@ def main():
 
   # Learning rate scheduler with warmup
   warmup_steps = 300 # 1000
+  grad_accum_steps = 4
   total_steps = num_epochs * len(dataloader)
   warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
   cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
@@ -625,13 +625,12 @@ def main():
   generate_video_file(model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4")
 
   # initialize tqdm progress bar
-  total_steps = -1
+  reduced_steps = -1
   curr_step = 0
   timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-  hparams = {"lr":{lr}, "batch_size": {batch_size}, "epochs":{num_epochs}, "warmup_steps":{warmup_steps}}
-  run_name = f"lr={hparams['lr']}_bs={hparams['batch_size']}_ep={hparams['epochs']}_ts={timestamp}_ws={hparams['warmup_steps']}"
+  hyperparams = {"lr":lr, "batch_size": batch_size, "epochs":num_epochs, "warmup_steps":warmup_steps, "grad_accum_steps":grad_accum_steps}
+  run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}"
   writer = SummaryWriter(log_dir=f"logs/{run_name}")
-  writer.add_hparams("hparam_dict": hparams, "metric_dict": {})
   for epoch in range(num_epochs):
     # min of len(dataloader) and total_steps   
     prog_bar_steps = len(dataloader) if total_steps < 0 else min(len(dataloader), total_steps)
@@ -639,16 +638,19 @@ def main():
     # run training loop with tqdm progress bar
     for step, batch in pbar:
         curr_step += 1
-        flow_loss, lpips_loss, pred_x0 = train_step(model, vae, lpips_fn, batch, scheduler, optimizer, device)
+        loss, flow_loss, lpips_loss, pred_x0 = train_step(model, vae, lpips_fn, batch, scheduler, grad_accum_steps, device)
 
-        lr_scheduler.step()
+        if step % grad_accum_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            lr_scheduler.step()
         #update progress bar
         pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}, lpips_loss: {lpips_loss:.6f}")
-        writer.add_scalar("Loss/train", flow_loss + 0.1 * lpips_loss, curr_step)
+        writer.add_scalar("Loss/train", loss, curr_step)
         writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
         writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
         writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
-        if total_steps > 0 and step >= total_steps:  # Just run a few steps for demo
+        if reduced_steps > 0 and step >= reduced_steps:  # Just run a few steps for demo
             break
     
     #generate a video at the end of each epoch
@@ -676,7 +678,8 @@ def main():
         print(f"Saved checkpoint to {checkpoint_path}")
 
   # final metrics for comparison against other runs.
-  writer.add_hparams("metric_dict": {
+  writer.add_hparams(hparam_dict=hyperparams,metric_dict={
+    "final_loss": loss,
     "final_flow_loss": flow_loss,
     "final_lpips_loss": lpips_loss,
   })
