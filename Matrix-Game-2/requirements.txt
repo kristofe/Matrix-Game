@@ -40,3 +40,5 @@ flask
 flask-socketio
 torchao
 peft
+lpips
+tensorboard

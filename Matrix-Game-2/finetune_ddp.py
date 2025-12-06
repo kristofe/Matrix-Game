@@ -703,6 +703,12 @@ def test_generate_video(img, device):
     )
     return video_tensor
 
+def pprint(str):
+    ''' 
+    Print only from main process 
+    '''
+    if is_main_process():
+        print(str)
 
 def main():
   # ==========================================================================
@@ -718,9 +724,8 @@ def main():
   # is_main controls logging/saving - only rank 0 should do these
   is_main = is_main_process()
 
-  if is_main:
-      print(f"Using device: {device}")
-      print(f"World size (total GPUs): {world_size}")
+  pprint(f"Using device: {device}")
+  pprint(f"World size (total GPUs): {world_size}")
 
   num_epochs = 10
   # === SEQUENCE LENGTH CONFIG ===
@@ -728,14 +733,13 @@ def main():
   latent_frames = 3  # Change this to experiment
   seq_config = get_sequence_config(latent_frames)
 
-  if is_main:  # Only print from main process
-      print(f"\n=== Sequence Config ===")
-      print(f"Latent frames: {seq_config['latent_frames']}")
-      print(f"Video frames: {seq_config['video_frames']}")
-      print(f"Batch size per GPU: {seq_config['batch_size']}")
-      print(f"Grad accum: {seq_config['grad_accum_steps']}")
-      # With DDP, effective batch = batch_size * grad_accum * world_size
-      print(f"Effective batch (with {world_size} GPUs): {seq_config['batch_size'] * seq_config['grad_accum_steps'] * world_size}")
+  pprint(f"\n=== Sequence Config ===")
+  pprint(f"Latent frames: {seq_config['latent_frames']}")
+  pprint(f"Video frames: {seq_config['video_frames']}")
+  pprint(f"Batch size per GPU: {seq_config['batch_size']}")
+  pprint(f"Grad accum: {seq_config['grad_accum_steps']}")
+  # With DDP, effective batch = batch_size * grad_accum * world_size
+  pprint(f"Effective batch (with {world_size} GPUs): {seq_config['batch_size'] * seq_config['grad_accum_steps'] * world_size}")
 
   batch_size = seq_config['batch_size']
   sequence_length = seq_config['video_frames']
@@ -765,15 +769,23 @@ def main():
       # Single GPU - use regular shuffle
       dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-  if is_main:
-      print("\nLoading model...")
+  pprint("\nLoading model...")
   model, vae, lpips_fn = load_model(device)
-  if is_main:
-      print("Model loaded.")
+  pprint("Model loaded.")
+  # ==========================================================================
+  # DDP MODEL WRAPPING - Wrap model with DistributedDataParallel
+  # ==========================================================================
+  # DDP wraps your model and handles:
+  # 1. Broadcasting initial weights from rank 0 to all GPUs
+  # 2. Averaging gradients across GPUs during backward pass
+  # 3. Keeping model weights synchronized
+  if world_size > 1:
+      # find_unused_parameters=True is needed if some parameters don't receive gradients
+      # (like our frozen action_model parameters)
+      model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+      pprint(f"Model wrapped with DDP across {world_size} GPUs")
 
-
-  if is_main:
-      print("Creating scheduler...")
+  pprint("Creating scheduler...")
   scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
 
   # creating output folder (only on main process)
@@ -781,7 +793,7 @@ def main():
   output_dir = f"outputs/finetune_ddp_{timestamp}"
   if is_main:
       os.makedirs(output_dir, exist_ok=True)
-      print(f"Outputs will be saved to: {output_dir}")
+  pprint(f"Outputs will be saved to: {output_dir}")
 
   # Synchronize all processes before continuing
   # This ensures the output directory is created before other processes try to use it
@@ -799,26 +811,12 @@ def main():
   trainable_params = [p for p in model.parameters() if p.requires_grad]
   trainable_count = sum(p.numel() for p in trainable_params)
   total_count = sum(p.numel() for p in model.parameters())
-  if is_main:
-      print(f"Froze {frozen_count} parameters in action modules.")
-      print(f"Trainable parameters: {trainable_count} / {total_count} ({100.0 * trainable_count / total_count:.2f}%)")
+  pprint(f"Froze {frozen_count} parameters in action modules.")
+  pprint(f"Trainable parameters: {trainable_count} / {total_count} ({100.0 * trainable_count / total_count:.2f}%)")
 
-  # ==========================================================================
-  # DDP MODEL WRAPPING - Wrap model with DistributedDataParallel
-  # ==========================================================================
-  # DDP wraps your model and handles:
-  # 1. Broadcasting initial weights from rank 0 to all GPUs
-  # 2. Averaging gradients across GPUs during backward pass
-  # 3. Keeping model weights synchronized
-  if world_size > 1:
-      # find_unused_parameters=True is needed if some parameters don't receive gradients
-      # (like our frozen action_model parameters)
-      model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-      if is_main:
-          print(f"Model wrapped with DDP across {world_size} GPUs")
 
-  if is_main:
-      print("\n=== Starting training loop ===")
+
+  pprint("\n=== Starting training loop ===")
   model.train()
   lr = 5e-6
   optimizer = torch.optim.AdamW(trainable_params, lr=lr)
