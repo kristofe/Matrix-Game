@@ -30,7 +30,7 @@ scikit-image
 huggingface_hub[cli]
 dominate
 nvidia-pyindex
-nvidia-tensorrt
+# tensorrt - install separately using: pip install tensorrt
 pycuda
 onnx
 onnxruntime
@@ -39,3 +39,4 @@ onnxconverter_common
 flask
 flask-socketio
 torchao
+peft

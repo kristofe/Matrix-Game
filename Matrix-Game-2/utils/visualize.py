@@ -72,7 +72,8 @@ def draw_rounded_rectangle(image, top_left, bottom_right, color, radius=10, alph
     cv2.ellipse(overlay, (x1 + radius, y2 - radius), (radius, radius), 90, 0, 90, color, -1)
     cv2.ellipse(overlay, (x2 - radius, y2 - radius), (radius, radius), 0, 0, 90, color, -1)
 
-    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+    result = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+    np.copyto(image, result)
 
 # 在帧上绘制按键
 def draw_keys_on_frame(frame, keys, key_size=(80, 50), spacing=20, bottom_margin=30, mode='universal'):
@@ -174,6 +175,9 @@ def process_video(input_video, output_video, config, mouse_icon_path, mouse_scal
     out_video = []
     frame_idx = 0
     for frame in input_video:
+        # Make a writable copy to avoid OpenCV memory layout issues
+        frame = np.ascontiguousarray(frame)
+        
         if process_icon == True:
             keys = key_data.get(frame_idx, {"W": False, "A": False, "S": False, "D": False, "left": False, "right": False})
             draw_keys_on_frame(frame, keys, key_size=(50, 50), spacing=10, bottom_margin=20, mode=mode)

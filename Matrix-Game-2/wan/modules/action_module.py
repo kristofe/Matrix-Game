@@ -1,23 +1,34 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
-from flash_attn import flash_attn_func
 import torch
 import torch.nn as nn
 from .posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
 import math
 from torch.nn.attention.flex_attention import flex_attention
 
+# Handle flash_attn import gracefully
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    print("Warning: flash_attn not available, using fallback attention")
+    FLASH_ATTN_AVAILABLE = False
+    def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), alibi_slopes=None, deterministic=False, return_attn_probs=False):
+        # Fallback to standard attention
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=causal)
+
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
 except:
-    from flash_attn import flash_attn_func
     FLASH_ATTN_3_AVAILABLE = False
 
 
 DISABLE_COMPILE = False  # get os env
-flex_attention = torch.compile(
-    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+# Commenting out torch.compile for flex_attention to avoid Triton compilation errors
+# with "Placeholder.DESCRIPTIVE_NAME" - see https://github.com/pytorch/pytorch/issues/133254
+# flex_attention = torch.compile(
+#     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
     
 
 class WanRMSNorm(nn.Module):
@@ -172,6 +183,19 @@ class ActionModule(nn.Module):
             )
             rope_sizes = [
                 s // self.patch_size[idx] for idx, s in enumerate(latents_size)
+            ]
+        else:
+            # Handle tuple or other types by converting to list
+            patch_size_list = list(self.patch_size) if hasattr(self.patch_size, '__iter__') else [self.patch_size]
+            assert all(
+                s % patch_size_list[idx] == 0
+                for idx, s in enumerate(latents_size)
+            ), (
+                f"Latent size(last {ndim} dimensions) should be divisible by patch size({self.patch_size}), "
+                f"but got {latents_size}."
+            )
+            rope_sizes = [
+                s // patch_size_list[idx] for idx, s in enumerate(latents_size)
             ]
 
         if len(rope_sizes) != target_ndim:
@@ -362,16 +386,17 @@ class ActionModule(nn.Module):
             k = self.key_attn_k_norm(k).to(v)
             S = th * tw
             assert S == 880
-            # position embed 
-            if use_rope_keyboard: 
+            # position embed
+            if use_rope_keyboard:
                 B, TS, H, D = q.shape
-                T_ = TS // S 
+                T_ = TS // S
                 q = q.view(B, T_, S, H, D).transpose(1, 2).reshape(B * S, T_, H, D)
                 q, k = apply_rotary_emb(q, k, freqs_cis, start_offset = start_frame,head_first=False)
 
-                k1, k2, k3, k4 = k.shape
-                k = k.expand(S, k2, k3, k4)
-                v = v.expand(S, k2, k3, k4)
+                # k and v have shape [B, T_, H, D], need to expand to [B*S, T_, H, D]
+                # by repeating each batch element S times
+                k = k.unsqueeze(1).expand(B, S, T_, H, D).reshape(B * S, T_, H, D)
+                v = v.unsqueeze(1).expand(B, S, T_, H, D).reshape(B * S, T_, H, D)
 
 
                 if is_causal:

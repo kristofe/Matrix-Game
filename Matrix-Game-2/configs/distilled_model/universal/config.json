@@ -4,7 +4,7 @@
   "action_config": {
     "blocks": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
     "enable_keyboard": true,
-    "enable_mouse": true,
+    "enable_mouse": false,
     "heads_num": 16,
     "hidden_size": 128,
     "img_hidden_size": 1536,

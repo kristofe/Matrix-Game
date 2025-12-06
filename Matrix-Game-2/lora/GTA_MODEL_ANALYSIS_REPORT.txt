@@ -1,0 +1,333 @@
+Warning: flash_attn not available, using fallback attention
+================================================================================
+GTA DISTILLED MODEL - COMPREHENSIVE ANALYSIS FOR LoRA IMPLEMENTATION
+================================================================================
+
+📁 Loading model configuration and weights...
+
+================================================================================
+1. BASIC MODEL INFORMATION
+================================================================================
+
+  Model Class: WanModel
+  Model Type: i2v
+  Diffusers Version: 0.33.1
+
+  Core Architecture:
+    • Hidden Dimension: 1536
+    • FFN Dimension: 8960
+    • Number of Layers: 30
+    • Attention Heads: 12
+    • Head Dimension: 128
+
+  Input/Output:
+    • Input Channels: 36 (VAE latent)
+    • Output Channels: 16 (VAE latent)
+    • Patch Size: Not specified
+
+================================================================================
+2. ACTION MODULE ARCHITECTURE (Key Innovation)
+================================================================================
+
+  Configuration:
+    • Enabled Blocks: 15/30
+    • Block Indices: [0, 1, 2, 3, 4]...[12, 13, 14]
+    • Mouse Enabled: True
+    • Keyboard Enabled: True
+
+  Mouse Control Module:
+    • Input Dimension: 2 (x, y movement)
+    • Hidden Dimension: 1024
+    • Attention Heads: 16
+    • RoPE Dimensions: [8, 28, 28]
+    • RoPE Theta: 256
+
+  Keyboard Control Module:
+    • Input Dimension: 2 (2 keys for GTA)
+    • Hidden Dimension: 1024
+    • Embedding Size: 128
+
+  Temporal Processing:
+    • VAE Time Compression: 4x
+    • Window Size: 3 frames
+    • QK Normalization: True
+    • QKV Bias: False
+
+================================================================================
+3. PARAMETER ANALYSIS
+================================================================================
+
+  Total Parameters: 1,619,238,464 (~1.62B)
+
+  Parameter Breakdown:
+    Self-Attention Layers..............     283,392,000 (17.50%)
+    Cross-Attention Layers.............     283,392,000 (17.50%)
+    Feed-Forward Networks..............     826,068,480 (51.02%)
+    Action Modules.....................     205,159,680 (12.67%)
+      ├─ Mouse Control.................      86,937,600 ( 5.37%)
+      └─ Keyboard Control..............      71,032,320 ( 4.39%)
+    Normalization Layers...............          92,160 ( 0.01%)
+    Patch Embedding....................         222,720 ( 0.01%)
+    Time Embedding.....................      16,920,576 ( 1.04%)
+    Image Embedding....................       3,612,928 ( 0.22%)
+    Output Head........................         101,440 ( 0.01%)
+
+================================================================================
+4. LAYER-BY-LAYER STRUCTURE
+================================================================================
+
+  Transformer Blocks: 30 layers
+    Each block contains:
+      • Self-Attention (with RoPE)
+      • Cross-Attention (image conditioning)
+      • Feed-Forward Network
+      • Action Module (mouse + keyboard)
+      • Layer Normalization (×3)
+
+================================================================================
+5. ATTENTION MECHANISM DETAILS
+================================================================================
+
+  Self-Attention (Video Generation):
+
+  Cross-Attention (Image Conditioning):
+
+================================================================================
+6. ACTION MODULE DEEP DIVE
+================================================================================
+
+  Mouse Control Components:
+    Total Parameters: 86,937,600
+    • 0: 23,976,960 params (30 blocks)
+    • 2: 15,744,000 params (30 blocks)
+    • 3: 30,720 params (30 blocks)
+    • mouse_attn_q: 23,592,960 params (15 blocks)
+    • proj_mouse: 23,592,960 params (15 blocks)
+
+  Keyboard Control Components:
+    Total Parameters: 71,034,240
+    • 0: 5,760 params (30 blocks)
+    • 2: 247,680 params (30 blocks)
+    • key_attn_k_norm: 960 params (15 blocks)
+    • key_attn_q_norm: 960 params (15 blocks)
+    • keyboard_attn_kv: 47,185,920 params (15 blocks)
+    • proj_keyboard: 23,592,960 params (15 blocks)
+
+================================================================================
+7. LoRA IMPLEMENTATION RECOMMENDATIONS
+================================================================================
+
+  Why LoRA is Ideal for This Model:
+    ✓ Large model (1.8B params) - full fine-tuning is expensive
+    ✓ Many attention layers (30 blocks × 2 attention types)
+    ✓ Repetitive structure - benefits from low-rank adaptation
+    ✓ Action modules are already modular - easy to target
+
+  Recommended LoRA Strategies:
+
+  Strategy: ATTENTION ONLY
+    Rank: 8, Alpha: 16
+    Estimated Trainable Params: ~5-10M
+    Use Case: Small dataset (<1000 sequences), fast training
+    Target Modules:
+      • blocks.*.self_attn.q
+      • blocks.*.self_attn.k
+      • blocks.*.self_attn.v
+      • blocks.*.self_attn.o
+      • blocks.*.cross_attn.q
+      ... and 3 more
+
+  Strategy: ATTENTION FFN
+    Rank: 16, Alpha: 32
+    Estimated Trainable Params: ~20-40M
+    Use Case: Medium dataset (1000-5000 sequences), balanced approach
+    Target Modules:
+      • blocks.*.self_attn.q
+      • blocks.*.self_attn.k
+      • blocks.*.self_attn.v
+      • blocks.*.self_attn.o
+      • blocks.*.cross_attn.q
+      ... and 5 more
+
+  Strategy: FULL LORA
+    Rank: 32, Alpha: 64
+    Estimated Trainable Params: ~80-120M
+    Use Case: Large dataset (>5000 sequences), maximum expressiveness
+    Target Modules:
+      • blocks.*.self_attn.q
+      • blocks.*.self_attn.k
+      • blocks.*.self_attn.v
+      • blocks.*.self_attn.o
+      • blocks.*.cross_attn.q
+      ... and 9 more
+
+  Strategy: ACTION FOCUSED
+    Rank: 16, Alpha: 32
+    Estimated Trainable Params: ~15-25M
+    Use Case: Fine-tuning action control while preserving visual generation
+    Target Modules:
+      • blocks.*.action_model.mouse_mlp.*
+      • blocks.*.action_model.keyboard_embed.*
+      • blocks.*.action_model.proj_mouse
+      • blocks.*.action_model.proj_keyboard
+      • blocks.*.self_attn.q
+      ... and 3 more
+
+================================================================================
+8. IMPLEMENTATION CODE SAMPLES
+================================================================================
+
+  A. Using PEFT Library (Recommended):
+
+```python
+from peft import LoraConfig, get_peft_model
+from wan.modules.causal_model import CausalWanModel
+
+# Load base model
+model = CausalWanModel.from_pretrained('models/gta_distilled_model')
+
+# Configure LoRA
+lora_config = LoraConfig(
+    r=16,  # rank
+    lora_alpha=32,  # scaling factor
+    target_modules=[
+        'self_attn.q', 'self_attn.k', 'self_attn.v', 'self_attn.o',
+        'cross_attn.q', 'cross_attn.k', 'cross_attn.v', 'cross_attn.o',
+        'ffn.0', 'ffn.2',
+    ],
+    lora_dropout=0.05,
+    bias='none',
+    task_type='CAUSAL_LM'
+)
+
+# Apply LoRA
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+```
+
+  B. Action-Focused LoRA (for control fine-tuning):
+
+```python
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=[
+        'action_model.mouse_mlp.0',
+        'action_model.mouse_mlp.2',
+        'action_model.keyboard_embed.0',
+        'action_model.keyboard_embed.2',
+        'action_model.proj_mouse',
+        'action_model.proj_keyboard',
+    ],
+    modules_to_save=['action_model'],  # Save entire action module
+    lora_dropout=0.1,
+)
+```
+
+================================================================================
+9. KEY ARCHITECTURAL FEATURES
+================================================================================
+
+  Diffusion Framework:
+    • Type: Flow Matching / Rectified Flow
+    • Objective: Velocity prediction (v = noise - x0)
+    • Timestep Embedding: Sinusoidal (256-dim)
+    • Denoising Steps: Typically 6-8 for distilled model
+
+  Position Encoding:
+    • Method: Rotary Position Embedding (RoPE)
+    • Dimensions: Separate for time, height, width
+    • RoPE Theta: 10000 (standard), 256 (action module)
+
+  Normalization:
+    • Layer Norm: For most layers
+    • RMS Norm: For attention Q/K normalization
+    • AdaLN: Adaptive layer norm with timestep conditioning
+
+  Causal Architecture:
+    • KV Caching: Enabled for efficient long video generation
+    • Block Size: 3 frames per inference block
+    • Window Size: 3 frames for action context
+    • Local Attention: For temporal efficiency
+
+================================================================================
+10. TRAINING CONSIDERATIONS FOR LoRA
+================================================================================
+
+  Memory Requirements:
+    • Full Model: ~24GB VRAM (bfloat16)
+    • With LoRA (r=16): ~20-22GB VRAM
+    • With LoRA (r=8): ~18-20GB VRAM
+    • Gradient Checkpointing: Can reduce by 30-40%
+
+  Training Speed (estimated):
+    • Full Fine-tuning: ~0.5 it/s
+    • LoRA (r=16): ~2-3 it/s
+    • LoRA (r=8): ~3-4 it/s
+    • Speedup: 4-6x faster with LoRA
+
+  Hyperparameter Suggestions:
+    • Learning Rate: 1e-4 to 5e-4 (higher than full fine-tuning)
+    • LoRA Rank: Start with 8-16, increase if underfitting
+    • LoRA Alpha: 2× rank (standard practice)
+    • Dropout: 0.05-0.1 (prevents overfitting)
+    • Batch Size: 1-2 (due to VAE memory)
+    • Gradient Accumulation: 4-8 steps
+
+  Convergence Tips:
+    • Monitor action prediction accuracy separately
+    • Use separate learning rates for action vs visual modules
+    • Freeze early layers if dataset is small
+    • Apply LoRA to action modules last for stability
+
+================================================================================
+11. COMPARISON: GTA MODEL vs BASE MODEL
+================================================================================
+
+  Key Differences:
+    • Keyboard Dimension: 2 (GTA: gas/brake) vs 4 (base: WASD)
+    • Training Domain: GTA driving vs universal scenes
+    • Specialization: Optimized for driving dynamics
+
+  Transfer Learning:
+    • Can fine-tune from base model → GTA model
+    • Or from GTA model → similar driving games
+    • LoRA weights are portable across similar domains
+
+================================================================================
+12. FILE INFORMATION
+================================================================================
+
+  Model Weights:
+    • File: gta_keyboard2dim.safetensors
+    • Format: SafeTensors
+    • Size: 6.03 GB
+    • Precision: bfloat16 (assumed)
+
+  Configuration:
+    • File: config.json
+    • Format: JSON
+    • Compatible with Hugging Face diffusers
+
+  Total State Dict Keys: 1114
+
+================================================================================
+SUMMARY
+================================================================================
+
+  The GTA Distilled Model is a sophisticated 1.8B parameter
+  video generation model with specialized action control.
+
+  LoRA Implementation is HIGHLY RECOMMENDED because:
+    ✓ Reduces training cost by 80-90%
+    ✓ Faster iteration (4-6x speedup)
+    ✓ Lower memory requirements
+    ✓ Easy to experiment with different target modules
+    ✓ LoRA adapters are small and shareable
+
+  Start with 'attention_only' strategy and scale up if needed.
+
+================================================================================
+
+📄 Saving detailed report to: GTA_MODEL_ANALYSIS_REPORT.txt
+

@@ -28,12 +28,21 @@ conda create -n matrix-game-2.0 python=3.10 -y
 conda activate matrix-game-2.0
 # install apex and FlashAttention
 # Our project also depends on [FlashAttention](https://github.com/Dao-AILab/flash-attention)
-git clone https://github.com/SkyworkAI/Matrix-Game.git
+git clone https://github.com/kristofe/Matrix-Game.git
 cd Matrix-Game-2
 pip install -r requirements.txt
 python setup.py develop
 ```
 
+install flash attn
+```
+MAX_JOBS=16 pip install flash-attn --no-build-isolation
+```
+
+install apex
+```
+
+```
 
 ## Quick Start
 ### Download checkpoints
@@ -62,10 +71,54 @@ python inference_streaming.py \
     --seed 42 \
     --pretrained_model_path {path-to-the-vae-folder}
 ```
+MY OWN COMMAND LINE
+```
+python inference.py \
+    --config_path configs/inference_yaml/inference_templerun.yaml \
+    --checkpoint_path models/templerun_distilled_model/templerun_7dim_onlykey.safetensors \
+    --img_path demo_images/temple_run/0000.png \
+    --output_folder outputs \
+    --num_output_frames 150 \
+    --seed 42 \
+    --pretrained_model_path models/
+```
+```
+python inference.py     --config_path configs/inference_yaml/inference_universal.yaml     --checkpoint_path models/base_distilled_model/base_distill.safetensors     --img_path demo_images/universal/0000.png     --output_folder outputs     --num_output_frames 150     --seed 42     --pretrained_model_path models/
+```
 
 ### Tips
 - In the current version, upward movement for camera may cause brief rendering glitches (e.g., black screens). A fix is planned for future updates. Adjust movement slightly or change direction to resolve it.
 
+## 🎯 Finetuning
+
+You can finetune the causal distilled model on your own gameplay data! The finetuned model will work with the efficient `inference.py` script.
+
+**Quick Start**:
+```bash
+# Train the model (35 seconds per epoch on RTX 3090)
+python finetune_causal_distilled.py \
+    --data_dir data \
+    --sequence_length 9 \
+    --num_epochs 10 \
+    --batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --learning_rate 1e-5
+
+# Run inference with your finetuned model
+python inference.py \
+    --config_path configs/inference_yaml/inference_universal.yaml \
+    --checkpoint_path checkpoints/causal_distilled_best.safetensors \
+    --img_path demo_images/universal/0000.png \
+    --output_folder outputs \
+    --num_output_frames 150 \
+    --pretrained_model_path models/
+```
+
+**Data Format**: 
+- Frames: `data/frame_0001.png`, `data/frame_0002.png`, ...
+- Actions: `data/input.csv` (format: `key,time,frame`)
+
+See [`CAUSAL_FINETUNING_GUIDE.md`](CAUSAL_FINETUNING_GUIDE.md) for complete documentation, troubleshooting, and technical details.
 
 ## ⭐ Acknowledgements
 
