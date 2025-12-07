@@ -5,6 +5,9 @@ Simple finetuning script - built from scratch to understand every piece.
 from datetime import datetime
 import torch
 import os
+
+# Memory optimization for CUDA - reduces fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import glob
 import csv
 import numpy as np
@@ -91,7 +94,7 @@ def is_main_process():
     return True
 
 class SimpleDataset(Dataset):
-  def __init__(self, data_dir="/media/kristofe/eight/data", sequence_length=9, max_sequences=-1):
+  def __init__(self, data_dir, sequence_length=9, max_sequences=-1):
       self.sequence_length = sequence_length
 
       # Find all runs
@@ -132,9 +135,9 @@ class SimpleDataset(Dataset):
               action, time, frame_num, value = row[0], float(row[1]), int(row[2]), float(row[3])
               if frame_num not in data:
                   data[frame_num] = {'steering': 0.0, 'throttle': 0.0}
-              debug_counter += 1
-              if debug_counter < 3:
-                  print(f"action {action} frame_num {frame_num} value {value}")
+              #debug_counter += 1
+              #if debug_counter < 3:
+              #    print(f"action {action} frame_num {frame_num} value {value}")
               data[frame_num][action] = value
       return data
 
@@ -258,7 +261,7 @@ def load_model(device):
     lpips_fn.eval()
     return model, vae, lpips_fn
 
-def get_sequence_config(latent_frames):
+def get_sequence_config(latent_frames, a100=False):
     """
     Calculate video frames and recommended batch size for a given number of latent frames.
     
@@ -285,6 +288,11 @@ def get_sequence_config(latent_frames):
     }
     
     config = memory_estimates.get(latent_frames, {"batch_size": 1, "grad_accum": 8})
+
+    if a100:
+        # A100 40GB is more constrained - use smaller batch and more accumulation
+        config["batch_size"] = 1
+        config["grad_accum"] = 8  # Increased to compensate for batch_size=1
     
     return {
         "latent_frames": latent_frames,
@@ -343,29 +351,33 @@ def train_step(model, vae, lpips_fn, batch, scheduler, accumulation_steps, devic
     target = scheduler.training_target(latents, noise, t_scalar)
     flow_loss = torch.nn.functional.mse_loss(flow_pred, target)
 
-    # LPIPS loss on reconstructed frames
+    # LPIPS loss on reconstructed frames (detached - no gradients through VAE/LPIPS)
+    # Detach pred_x0 to prevent gradient flow through LPIPS - saves significant memory
     with torch.no_grad():
-        pred_frames = vae.decode(pred_x0.to(torch.float16), device=device)
-    
-    # LPIPS expects [B, C, H, W] so we average over frames
-    # frames is already [B, C, T, H, W] from earlier
-    B, C, T, H, W = frames.shape
-    pred_flat = pred_frames.reshape(B * T, C, H, W).float()
-    gt_flat = frames.reshape(B * T, C, H, W).float()
-    lpips_loss = lpips_fn(pred_flat, gt_flat).mean()
+        pred_x0_detached = pred_x0.detach()
+        pred_frames = vae.decode(pred_x0_detached.to(torch.float16), device=device)
+        
+        # LPIPS expects [B, C, H, W] so we flatten time dimension
+        B, C, T, H, W = frames.shape
+        pred_flat = pred_frames.reshape(B * T, C, H, W)
+        gt_flat = frames.reshape(B * T, C, H, W)
+        lpips_loss = lpips_fn(pred_flat, gt_flat).mean()
 
-    # Combined loss
+    # Combined loss - LPIPS provides guidance signal but gradients only flow through flow_loss
     loss = flow_loss + lpips_weight * lpips_loss
     loss = loss / accumulation_steps  # normalize for gradient accumulation
+
+    # Free memory before backward pass
+    del frames, latents, noise, noisy_latents, flow_pred, cond_concat, conditional_dict
+    del pred_frames, pred_flat, gt_flat
+    torch.cuda.empty_cache()
 
     loss.backward()
 
     #clip gradients
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-    #backprop - Nope... doing this outside for gradient accumulation
-
-    return loss.item(),flow_loss.item(), lpips_loss.item(), pred_x0 
+    return loss.item(), flow_loss.item(), lpips_loss.item(), pred_x0_detached 
 
 def test_logic(dataloader, model, vae, scheduler, device):
   # 1. Grab one batch
@@ -693,8 +705,9 @@ def main():
   num_epochs = 10
   # === SEQUENCE LENGTH CONFIG ===
   # Choose latent frames: 3, 5, 9, 13 (higher = better temporal consistency but more memory)
-  latent_frames = 5  # Change this to experiment
-  seq_config = get_sequence_config(latent_frames)
+  # A100 40GB: use latent_frames=3 (video_frames=9). latent_frames=5 causes OOM during backward.
+  latent_frames = 3  # Reduced for A100 40GB memory constraints
+  seq_config = get_sequence_config(latent_frames, a100=True)
   
   print(f"\n=== Sequence Config ===")
   print(f"Latent frames: {seq_config['latent_frames']}")
@@ -707,7 +720,7 @@ def main():
   sequence_length = seq_config['video_frames']
   grad_accum_steps = seq_config['grad_accum_steps']
 
-  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=900)
+  dataset = SimpleDataset(data_dir="/mnt/s3/uedata", sequence_length=sequence_length, max_sequences=900)
   dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
   print("\nLoading model...")
   model, vae, lpips_fn = load_model(device)
