@@ -834,11 +834,12 @@ def main():
 
   pprint("\n=== Starting training loop ===")
   model.train()
-  lr = 5e-6
+  lr = 1e-6
   optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
   # Learning rate scheduler with warmup
-  warmup_steps = 30 # 1000
+  warmup_steps = 1000
+  write_video_interval = 500
   grad_accum_steps = 4
   total_steps = num_epochs * len(dataloader)
   warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
@@ -913,6 +914,23 @@ def main():
 
         if reduced_steps > 0 and step >= reduced_steps:  # Just run a few steps for demo
             break
+        if is_main and curr_step % write_video_interval == 0:
+            # For DDP, access underlying model with model.module
+            raw_model = model.module if world_size > 1 else model
+
+            # Generate a video at the end of each epoch
+            initial_frame = dataloader.dataset[np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]
+            vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_e{epoch}.mp4")
+
+            # Extract first middle and last frames for tensorboard
+            mid_frame = vid[vid.shape[0] // 2]
+            first_frame = vid[0]
+            last_frame = vid[-1]
+            import torchvision.utils as vutils
+            grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2).float() / 255.0, nrow=3)
+            writer.add_image(f"Generated Video Frames", grid, epoch)
+            vutils.save_image(grid, f"{output_dir}/generated_frames_step{curr_step}.png")
+
 
     # Video generation and checkpointing only on main process
     if is_main:
