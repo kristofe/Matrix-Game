@@ -537,8 +537,8 @@ def main():
     sequence_length = seq_config['video_frames']
     grad_accum_steps = seq_config['grad_accum_steps']
 
-    # dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
-    dataset = SimpleDataset(data_dir="/mnt/d/data_640_360_300_sessions", sequence_length=sequence_length, max_sequences=max_sequences)
+    dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
+    # dataset = SimpleDataset(data_dir="/mnt/d/data_640_360_300_sessions", sequence_length=sequence_length, max_sequences=max_sequences)
 
     # ==========================================================================
     # DDP DATALOADER - Use DistributedSampler for multi-GPU
@@ -644,7 +644,7 @@ def main():
     # TensorBoard writer only on main process
     writer = None
     if is_main:
-        run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_sl={hyperparams['sequence_length']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}_fm={'_'.join(hyperparams['frozen_modules'])}_gpus={world_size}"
+        run_name = f"ft_univ_lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_sl={hyperparams['sequence_length']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}_fm={'_'.join(hyperparams['frozen_modules'])}_gpus={world_size}"
         writer = SummaryWriter(log_dir=f"logs/{run_name}")
 
     for epoch in range(num_epochs):
