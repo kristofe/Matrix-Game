@@ -39,7 +39,6 @@ from utils.scheduler import FlowMatchScheduler
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from utils.visualize import process_video
-import lpips
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 # ============================================================================
@@ -250,7 +249,7 @@ def verify_batch(batch):
     print(f"Keyboard actions shape: {keyboard.shape}")  # expect [B, T, 2]
     print(f"Mouse actions shape: {mouse.shape}")        # expect [B, T, 2]
 
-def load_model(device):
+def load_model(device, gradient_checkpointing=False):
     #load config
     config = OmegaConf.load("configs/inference_yaml/inference_gta_drive.yaml")
     config.model_kwargs.model_config = "configs/distilled_model/gta_drive"
@@ -263,6 +262,11 @@ def load_model(device):
     state_dict = load_file(checkpoint)
     model.load_state_dict(state_dict, strict=False)
 
+    # Enable gradient checkpointing to save ~30-50% activation memory (slower training)
+    if gradient_checkpointing:
+        model.model.gradient_checkpointing = True
+        print("Gradient checkpointing ENABLED - saves memory but ~20-30% slower")
+
     model = model.to(device, dtype=torch.bfloat16)
     model.eval()
 
@@ -273,44 +277,56 @@ def load_model(device):
     vae.eval()
     vae = vae.to(device, dtype=torch.float16)
 
+    return model, vae
 
-    lpips_fn = lpips.LPIPS(net='alex').to(device)
-    lpips_fn.requires_grad_(False)
-    lpips_fn.eval()
-    return model, vae, lpips_fn
-
-def get_sequence_config(latent_frames, a100=False):
+def get_sequence_config(latent_frames, gpu="rtx6000", gradient_checkpointing=False):
     """
-    Calculate video frames and recommended batch size for a given number of latent frames.
-    
-    Formula: video_frames = 1 + 4 * (latent_frames - 1)
-    
-    Common configs:
-      latent_frames=3  → video_frames=9   
-      latent_frames=5  → video_frames=17
-      latent_frames=9  → video_frames=33
-      latent_frames=13 → video_frames=49
-      latent_frames=21 → video_frames=81  (3.2s at 25fps)
+    Config for LoRA Training.
+
+    Args:
+        latent_frames: Number of latent frames (video_frames = 1 + 4 * (latent_frames - 1))
+        gpu: "a100" (40GB) or "rtx6000" (96GB)
+        gradient_checkpointing: If True, uses configs optimized for ~30-50% less memory
     """
     video_frames = 1 + 4 * (latent_frames - 1)
-    
-    # Memory scales roughly linearly with latent frames
-    # Base: latent_frames=3 uses ~27GB per sample at inference
-    # Training uses more due to gradients
-    memory_estimates = {
-        3: {"batch_size": 3, "grad_accum": 4},   # ~80GB total
-        5: {"batch_size": 2, "grad_accum": 6},   # ~90GB total
-        9: {"batch_size": 1, "grad_accum": 12},  # ~80GB total
-        13: {"batch_size": 1, "grad_accum": 12}, # ~95GB total (might be tight)
-        21: {"batch_size": 1, "grad_accum": 12}, # Won't fit in 96GB
-    }
-    
-    config = memory_estimates.get(latent_frames, {"batch_size": 1, "grad_accum": 8})
 
-    if a100:
-        # A100 40GB is more constrained - use smaller batch and more accumulation
-        config["batch_size"] = 1
-        config["grad_accum"] = 8  # Increased to compensate for batch_size=1
+    if gradient_checkpointing:
+        # With gradient checkpointing: ~30-50% memory savings
+        # Measured on RTX 6000 (96GB): 15 frames=72GB, 17/19/21=OOM
+        configs = {
+            "a100": {  # 40GB - checkpointing enables longer sequences
+                3:  {"batch_size": 3, "grad_accum": 4},   # ~25GB
+                5:  {"batch_size": 2, "grad_accum": 6},   # ~30GB
+                9:  {"batch_size": 1, "grad_accum": 12},  # ~35GB
+            },
+            "rtx6000": {  # 96GB
+                3:  {"batch_size": 6, "grad_accum": 2},   # ~25GB
+                5:  {"batch_size": 4, "grad_accum": 3},   # ~40GB
+                9:  {"batch_size": 3, "grad_accum": 5},   # ~55GB
+                11: {"batch_size": 2, "grad_accum": 4},   # ~65GB
+                13: {"batch_size": 2, "grad_accum": 6},   # ~70GB
+                15: {"batch_size": 1, "grad_accum": 12},  # ~72GB (measured) 
+                17: {"batch_size": 1, "grad_accum": 12},  # ~88GB (measured) - MAX for 96GB
+                # 17, 19, 21 cause OOM on 96GB even with checkpointing
+            },
+        }
+    else:
+        # Without gradient checkpointing (faster but more memory)
+        configs = {
+            "a100": {  # 40GB
+                3:  {"batch_size": 2, "grad_accum": 6},
+                5:  {"batch_size": 1, "grad_accum": 12},
+            },
+            "rtx6000": {  # 96GB
+                3:  {"batch_size": 4, "grad_accum": 3},   # ~35GB
+                5:  {"batch_size": 3, "grad_accum": 4},   # ~55GB
+                9:  {"batch_size": 2, "grad_accum": 6},   # ~85GB
+                11: {"batch_size": 1, "grad_accum": 12},  # ~96GB (barely fits and might crash)
+            },
+        }
+
+    gpu_configs = configs.get(gpu, configs["a100"])
+    config = gpu_configs.get(latent_frames, {"batch_size": 1, "grad_accum": 12})
 
     return {
         "latent_frames": latent_frames,
@@ -320,7 +336,7 @@ def get_sequence_config(latent_frames, a100=False):
         "effective_batch_size": config["batch_size"] * config["grad_accum"],
     }
 
-def train_step(model, vae, lpips_fn, batch, scheduler, accumulation_steps, device, lpips_weight=0.6):
+def train_step(model, vae, batch, scheduler, accumulation_steps, device ):
     frames = batch['video_frames'].to(device, dtype=torch.float16)
     frames = frames.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
 
@@ -331,6 +347,9 @@ def train_step(model, vae, lpips_fn, batch, scheduler, accumulation_steps, devic
         latents = vae.encode(frames, device=device).to(dtype=torch.bfloat16)
         visual_context = vae.clip.encode_video(frames).to(device=device, dtype=torch.bfloat16)
         raw_model.model.num_frame_per_block = latents.shape[2]
+
+    # Free frames early - no longer needed after encoding
+    del frames
 
     #prepare conditions
     num_latent_frames = latents.shape[2]
@@ -362,43 +381,32 @@ def train_step(model, vae, lpips_fn, batch, scheduler, accumulation_steps, devic
         "keyboard_cond": keyboard,
         "mouse_cond": mouse,
     }
-    flow_pred, pred_x0 = model(
-        noisy_image_or_video=noisy_latents,
-        timestep = timestep,
-        conditional_dict = conditional_dict,
-    )   
 
-    # flow matching loss: predict velocity (latents - noise)
-    target = scheduler.training_target(latents, noise, t_scalar)
-    flow_loss = torch.nn.functional.mse_loss(flow_pred, target)
+    # Use autocast for bfloat16 on the forward to save some memory
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        flow_pred, pred_x0 = model(
+            noisy_image_or_video=noisy_latents,
+            timestep = timestep,
+            conditional_dict = conditional_dict,
+        )   
 
-    # LPIPS loss on reconstructed frames (detached - no gradients through VAE/LPIPS)
-    # Detach pred_x0 to prevent gradient flow through LPIPS - saves significant memory
-    with torch.no_grad():
-        pred_x0_detached = pred_x0.detach()
-        pred_frames = vae.decode(pred_x0_detached.to(torch.float16), device=device)
-        
-        # LPIPS expects [B, C, H, W] so we flatten time dimension
-        B, C, T, H, W = frames.shape
-        pred_flat = pred_frames.reshape(B * T, C, H, W)
-        gt_flat = frames.reshape(B * T, C, H, W)
-        lpips_loss = lpips_fn(pred_flat, gt_flat).mean()
+        # flow matching loss: predict velocity (latents - noise)
+        target = scheduler.training_target(latents, noise, t_scalar)
+        flow_loss = torch.nn.functional.mse_loss(flow_pred, target)
 
-    # Combined loss - LPIPS provides guidance signal but gradients only flow through flow_loss
-    loss = flow_loss + lpips_weight * lpips_loss
+    loss = flow_loss
     loss = loss / accumulation_steps  # normalize for gradient accumulation
 
-    # Free memory before backward pass
-    del frames, latents, noise, noisy_latents, flow_pred, cond_concat, conditional_dict
-    del pred_frames, pred_flat, gt_flat
-    torch.cuda.empty_cache()
+    # Free memory before backward pass (del allows Python/CUDA to reclaim)
+    del latents, noise, noisy_latents, flow_pred, cond_concat, conditional_dict
+    del target, visual_context, keyboard, mouse, mask_cond
 
     loss.backward()
 
     #clip gradients
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-    return loss.item(), flow_loss.item(), lpips_loss.item(), pred_x0_detached 
+    return loss.item(), flow_loss.item(),pred_x0 
 
 def test_logic(dataloader, model, vae, scheduler, device):
   # 1. Grab one batch
@@ -677,7 +685,7 @@ def test_generate_video(img, device):
     import numpy as np
 
     # Load finetuned model
-    model, vae, lpips_fn = load_model(device)
+    model, vae = load_model(device)
 
     # Create constant actions (driving forward)
     num_action_steps = 89
@@ -742,14 +750,21 @@ def main():
   pprint(f"Using device: {device}")
   pprint(f"World size (total GPUs): {world_size}")
 
-  num_epochs = 10
   # === SEQUENCE LENGTH CONFIG ===
-  # Choose latent frames: 3, 5, 9, 13 (higher = better temporal consistency but more memory)
-  # A100 40GB: use latent_frames=3 (video_frames=9). latent_frames=5 causes OOM during backward.
-  latent_frames = 3  # Reduced for A100 40GB memory constraints
-  seq_config = get_sequence_config(latent_frames, a100=True)
+  # Choose latent frames: 3, 5, 9, 13, 15, 17, 19, 21 (higher = better temporal consistency but more memory)
+  # With gradient checkpointing on RTX 6000: latent_frames=15 uses ~72GB, latent_frames=19 uses ~98GB
+  latent_frames = 9 
+  num_epochs = 5
+  max_sequences = 400  #9000 # Limit dataset size for quicker testing
+  lr = 1e-6
+  warmup_steps = 100 # 1000
+  write_video_interval = 100
+  enable_gradient_checkpointing = True  # Save ~30-50% memory (20-30% slower)
+
+  seq_config = get_sequence_config(latent_frames, gpu="rtx6000", gradient_checkpointing=enable_gradient_checkpointing)
 
   pprint(f"\n=== Sequence Config ===")
+  pprint(f"Gradient checkpointing: {enable_gradient_checkpointing}")
   pprint(f"Latent frames: {seq_config['latent_frames']}")
   pprint(f"Video frames: {seq_config['video_frames']}")
   pprint(f"Batch size per GPU: {seq_config['batch_size']}")
@@ -760,10 +775,10 @@ def main():
   batch_size = seq_config['batch_size']
   sequence_length = seq_config['video_frames']
   grad_accum_steps = seq_config['grad_accum_steps']
-  max_sequences = -1  #9000 # Limit dataset size for quicker testing
 
 
-  dataset = SimpleDataset(data_dir="/mnt/s3/uedata", sequence_length=sequence_length, max_sequences=max_sequences)
+  #dataset = SimpleDataset(data_dir="/mnt/s3/uedata", sequence_length=sequence_length, max_sequences=max_sequences)
+  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
 
   # ==========================================================================
   # DDP DATALOADER - Use DistributedSampler for multi-GPU
@@ -786,7 +801,8 @@ def main():
       dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
   pprint("\nLoading model...")
-  model, vae, lpips_fn = load_model(device)
+  # gradient_checkpointing=True saves ~30-50% memory but ~20-30% slower training
+  model, vae = load_model(device, gradient_checkpointing=enable_gradient_checkpointing)
   pprint("Model loaded.")
   # ==========================================================================
   # DDP MODEL WRAPPING - Wrap model with DistributedDataParallel
@@ -805,7 +821,7 @@ def main():
   scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
 
   # creating output folder (only on main process)
-  timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+  timestamp = datetime.now().strftime("%Y%m%d-%H_%M_%S")
   output_dir = f"outputs/finetune_ddp_{timestamp}"
   if is_main:
       os.makedirs(output_dir, exist_ok=True)
@@ -834,13 +850,9 @@ def main():
 
   pprint("\n=== Starting training loop ===")
   model.train()
-  lr = 1e-6
   optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
   # Learning rate scheduler with warmup
-  warmup_steps = 1000
-  write_video_interval = 500
-  grad_accum_steps = 4
   total_steps = num_epochs * len(dataloader)
   warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
   cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
@@ -856,7 +868,6 @@ def main():
   # initialize tqdm progress bar
   reduced_steps = -1
   curr_step = 0
-  timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
   hyperparams = {
     "lr": lr,
     "batch_size": batch_size,
@@ -896,22 +907,23 @@ def main():
     # run training loop with tqdm progress bar
     for step, batch in pbar:
         curr_step += 1
-        loss, flow_loss, lpips_loss, pred_x0 = train_step(model, vae, lpips_fn, batch, scheduler, grad_accum_steps, device)
+        loss, flow_loss, pred_x0 = train_step(model, vae, batch, scheduler, grad_accum_steps, device)
 
         if step % grad_accum_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
             lr_scheduler.step()
 
-        # Logging only on main process
-        if is_main:
-            pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}, lpips_loss: {lpips_loss:.6f}")
-            writer.add_scalar("Loss/train", loss, curr_step)
-            writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
-            writer.add_scalar("LPIPS Loss/train", lpips_loss, curr_step)
-            writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
-            writer.add_scalar("LR", optimizer.param_groups[0]['lr'], curr_step)
+            # Logging only on main process
+            if is_main:
+                writer.add_scalar("Loss/train", loss, curr_step)
+                writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
+                writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
+                writer.add_scalar("LR", optimizer.param_groups[0]['lr'], curr_step)
 
+        if is_main:
+                pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}")
+                
         if reduced_steps > 0 and step >= reduced_steps:  # Just run a few steps for demo
             break
         if is_main and curr_step % write_video_interval == 0:
@@ -920,7 +932,7 @@ def main():
 
             # Generate a video at the end of each epoch
             initial_frame = dataloader.dataset[np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]
-            vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_e{epoch}.mp4")
+            vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_s{curr_step}.mp4")
 
             # Extract first middle and last frames for tensorboard
             mid_frame = vid[vid.shape[0] // 2]
@@ -928,9 +940,8 @@ def main():
             last_frame = vid[-1]
             import torchvision.utils as vutils
             grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2).float() / 255.0, nrow=3)
-            writer.add_image(f"Generated Video Frames", grid, epoch)
+            writer.add_image(f"Generated Video Frames", grid, curr_step)
             vutils.save_image(grid, f"{output_dir}/generated_frames_step{curr_step}.png")
-
 
     # Video generation and checkpointing only on main process
     if is_main:
@@ -972,7 +983,6 @@ def main():
       writer.add_hparams(hparam_dict=hyperparams, metric_dict={
         "final_loss": loss,
         "final_flow_loss": flow_loss,
-        "final_lpips_loss": lpips_loss,
       })
       writer.close()
 

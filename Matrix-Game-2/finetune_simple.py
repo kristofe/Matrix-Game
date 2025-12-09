@@ -703,7 +703,7 @@ def main():
   print(f"Using device: {device}")
 
   num_epochs = 5
-  max_sequences = 30  # limit dataset size for quick testing
+  max_sequences = 1000  # limit dataset size for quick testing
   # === SEQUENCE LENGTH CONFIG ===
   # Choose latent frames: 3, 5, 9, 13 (higher = better temporal consistency but more memory)
   # A100 40GB: use latent_frames=3 (video_frames=9). latent_frames=5 causes OOM during backward.
@@ -739,7 +739,7 @@ def main():
   '''
 
   # creating output folder
-  timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+  timestamp = datetime.now().strftime("%Y%m%d-%H-%M-%S")
   output_dir = f"outputs/finetune_simple_{timestamp}"
   os.makedirs(output_dir, exist_ok=True)    
   print(f"Outputs will be saved to: {output_dir}")
@@ -779,7 +779,6 @@ def main():
   # initialize tqdm progress bar
   reduced_steps = -1
   curr_step = 0
-  timestamp = datetime.now().strftime("%y%m%d-%H%M%S")
   hyperparams = {
     "lr": lr, 
     "batch_size": batch_size, 
