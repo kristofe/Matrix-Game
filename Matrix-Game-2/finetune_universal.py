@@ -237,20 +237,15 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
     num_action_steps = 89
     keyboard = torch.zeros(num_action_steps, 4)
     keyboard[:, 0] = 1  # forward
-    #TODO: make the steering in sine wave
-    keyboard[:, 2] = (steer_values < -0.1).float()  # left
-    keyboard[:, 3] = (steer_values > 0.1).float()   # right
 
-    mouse = torch.zeros(num_action_steps, 2)  # no camera movement
 
-    '''
     # steer in a sloted sine wave
     steer_amplitude = 0.05
     steer_frequency = 2 * torch.pi / num_action_steps * 2  # 2 full waves over the video
     steer_values = steer_amplitude * torch.sin(torch.linspace(0, steer_frequency * num_action_steps, num_action_steps))
+    keyboard[:, 2] = (steer_values < -0.1).float()  # left
+    keyboard[:, 3] = (steer_values > 0.1).float()   # right
     mouse = torch.zeros(num_action_steps, 2)
-    mouse[:, 1] = steer_values  # horizontal steering
-    '''
 
     # Generate
     video = generate_video(model, vae, initial_frame, keyboard, mouse, device)
@@ -353,16 +348,6 @@ def train_step(model, vae, batch, scheduler, accumulation_steps, device):
     return loss.item(), flow_loss.item(), pred_x0
 
 
-# ============================================================================
-# VIDEO GENERATION - TODO: Adapt for universal model
-# ============================================================================
-def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
-    """Generate video using universal model."""
-    # TODO: Adapt this to use universal model actions and mode
-    # Reference inference.py for correct universal mode usage
-    raise NotImplementedError("Video generation needs adaptation for universal model")
-
-
 def pprint(str):
     """Print only from main process."""
     if is_main_process():
@@ -415,7 +400,7 @@ def get_sequence_config(latent_frames, gpu="rtx6000", gradient_checkpointing=Fal
         "effective_batch_size": config["batch_size"] * config["grad_accum"],
     }
 
-
+ 
 def main():
     # DDP SETUP
     rank, local_rank, world_size = setup_distributed()
@@ -449,7 +434,7 @@ def main():
     grad_accum_steps = seq_config['grad_accum_steps']
 
     # dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
-     dataset = SimpleDataset(data_dir="/mnt/d/data_640_360_300_sessions", sequence_length=sequence_length, max_sequences=max_sequences)
+    dataset = SimpleDataset(data_dir="/mnt/d/data_640_360_300_sessions", sequence_length=sequence_length, max_sequences=max_sequences)
 
     cleanup_distributed()
 
