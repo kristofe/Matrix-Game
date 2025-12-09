@@ -226,6 +226,110 @@ def load_model(device, gradient_checkpointing=False):
     return model, vae
 
 
+def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, device):
+    '''
+    Generate a 3-second video (90 frames = 23 latent frames) given an initial frame and actions.
+
+    Args:
+        model: the trained diffusion model
+        vae: the VAE for encoding/decoding
+        scheduler: the diffusion scheduler
+        initial_frame: [1, C, H, W] tensor, initial frame in [-1, 1]
+        keyboard_actions: [num_action_steps, 4] tensor (forward, back)
+        mouse_actions: [num_action_steps,  2] tensor, (vertical, horizontal/steering) scaled by 0.1
+        device: torch device
+        num_inference_steps: number of diffusion steps
+    '''
+    from einops import rearrange
+    from pipeline import CausalInferencePipeline
+    from demo_utils.vae_block3 import VAEDecoderWrapper
+
+    num_output_frames = 21  # latent frames = 81 video frames (~3.2s at 25fps)
+    num_action_steps = 1 + 4 * (num_output_frames - 1)  # 81
+
+    #process initial frame if needed
+    if not isinstance(initial_frame, torch.Tensor):
+        # PIL image
+        from torchvision.transforms import v2
+        transform = v2.Compose([
+            v2.Resize((352, 640),antialias=True),
+            v2.ToTensor(),
+            v2.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]),
+        ])
+        initial_frame = transform(initial_frame).unsqueeze(0)  # [1, C, H, W]
+    elif initial_frame.ndim == 3:
+        # [H, W, C] tensor from dataset - already in [-1, 1]
+        initial_frame = initial_frame.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+
+    weight_dtype = torch.bfloat16
+
+    # Build VAE decoder for pipeline
+    vae_decoder = VAEDecoderWrapper()
+    vae_state_dict = torch.load("models/Wan2.1_VAE.pth", map_location="cpu")
+    decoder_state_dict = {}
+    for key, value in vae_state_dict.items():
+        if 'decoder.' in key or 'conv2' in key:
+            decoder_state_dict[key] = value
+    vae_decoder.load_state_dict(decoder_state_dict)
+    vae_decoder.to(device, torch.float16)
+    vae_decoder.requires_grad_(False)
+    vae_decoder.eval()
+
+    # Load config and build pipeline
+    config = OmegaConf.load("configs/inference_yaml/inference_universal.yaml")
+    pipeline = CausalInferencePipeline(config, generator=model, vae_decoder=vae_decoder)
+    pipeline = pipeline.to(device=device, dtype=weight_dtype)
+    pipeline.vae_decoder.to(torch.float16)
+
+    # Match inference.py exactly: image is [1, C, 1, H, W] in weight_dtype
+    initial_frame = initial_frame.to(device=device, dtype=weight_dtype)
+    image = initial_frame.unsqueeze(2)  # [1, C, 1, H, W]
+
+    # Padding matches image dtype (like zeros_like in inference.py)
+    padding_video = torch.zeros_like(image).repeat(1, 1, 4 * (num_output_frames - 1), 1, 1)
+    img_cond_input = torch.cat([image, padding_video], dim=2)
+
+    with torch.no_grad():
+        tiler_kwargs = {"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
+        img_cond = vae.encode(img_cond_input.to(torch.float16), device=device, **tiler_kwargs).to(device)
+
+    # Build conditioning like inference.py
+    mask_cond = torch.ones_like(img_cond)
+    mask_cond[:, :, 1:] = 0
+    cond_concat = torch.cat([mask_cond[:, :4], img_cond], dim=1)
+    visual_context = vae.clip.encode_video(image.to(torch.float16))
+
+    # Prepare noise and actions
+    sampled_noise = torch.randn(1, 16, num_output_frames, 44, 80, device=device, dtype=weight_dtype)
+
+    keyboard = keyboard_actions[:num_action_steps].unsqueeze(0).to(device, dtype=weight_dtype)
+    mouse = mouse_actions[:num_action_steps].unsqueeze(0).to(device, dtype=weight_dtype)
+
+    conditional_dict = {
+        "cond_concat": cond_concat.to(device=device, dtype=weight_dtype),
+        "visual_context": visual_context.to(device=device, dtype=weight_dtype),
+        "keyboard_cond": keyboard,
+        "mouse_cond": mouse,
+    }
+
+    # Run inference using the proper pipeline
+    with torch.no_grad():
+        videos = pipeline.inference(
+            noise=sampled_noise,
+            conditional_dict=conditional_dict,
+            return_latents=False,
+            mode='universal',
+            profile=False
+        )
+
+    # Convert output
+    videos_tensor = torch.cat(videos, dim=1)
+    videos = rearrange(videos_tensor, "B T C H W -> B T H W C")
+    video = ((videos.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)[0]
+    video = np.ascontiguousarray(video)
+
+    return video
+
 def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
     from PIL import Image
     import numpy as np
@@ -258,7 +362,7 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
 
     # Build config tuple (keyboard_actions, mouse_actions)
     config = (
-        keyboard.cpu().numpy(),  # [num_action_steps, 2]
+        keyboard.cpu().numpy(),  # [num_action_steps, 4]
         mouse.cpu().numpy()      # [num_action_steps, 2]
     )
 
@@ -436,8 +540,221 @@ def main():
     # dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
     dataset = SimpleDataset(data_dir="/mnt/d/data_640_360_300_sessions", sequence_length=sequence_length, max_sequences=max_sequences)
 
-    cleanup_distributed()
+    # ==========================================================================
+    # DDP DATALOADER - Use DistributedSampler for multi-GPU
+    # ==========================================================================
+    # DistributedSampler automatically splits data across GPUs
+    # - GPU 0 gets samples 0, 2, 4, 6, ...
+    # - GPU 1 gets samples 1, 3, 5, 7, ...
+    # This ensures each GPU sees different data each batch
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,  # Total number of GPUs
+            rank=rank,                 # This GPU's rank
+            shuffle=True,              # Shuffle within each epoch
+        )
+        # When using sampler, set shuffle=False in DataLoader (sampler handles it)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, sampler=sampler)
+    else:
+        # Single GPU - use regular shuffle
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    pprint("\nLoading model...")
+    # gradient_checkpointing=True saves ~30-50% memory but ~20-30% slower training
+    model, vae = load_model(device, gradient_checkpointing=enable_gradient_checkpointing)
+    pprint("Model loaded.")
+    # ==========================================================================
+    # DDP MODEL WRAPPING - Wrap model with DistributedDataParallel
+    # ==========================================================================
+    # DDP wraps your model and handles:
+    # 1. Broadcasting initial weights from rank 0 to all GPUs
+    # 2. Averaging gradients across GPUs during backward pass
+    # 3. Keeping model weights synchronized
+    if world_size > 1:
+        # find_unused_parameters=True is needed if some parameters don't receive gradients
+        # (like our frozen action_model parameters)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        pprint(f"Model wrapped with DDP across {world_size} GPUs")
+
+    pprint("Creating scheduler...")
+    scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+
+    # creating output folder (only on main process)
+    timestamp = datetime.now().strftime("%Y%m%d-%H_%M_%S")
+    output_dir = f"outputs/finetune_universal_{timestamp}"
+    if is_main:
+        os.makedirs(output_dir, exist_ok=True)
+    pprint(f"Outputs will be saved to: {output_dir}")
+
+    # Synchronize all processes before continuing
+    # This ensures the output directory is created before other processes try to use it
+    if world_size > 1:
+        dist.barrier()
+
+    #freeze action modules - preserve learned action-video mapping
+    frozen_count = 0
+    frozen_modules = ['action_model']
+    for name, param in model.named_parameters():
+        if any(fm in name for fm in frozen_modules):
+            param.requires_grad = False
+            frozen_count += param.numel()
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_count = sum(p.numel() for p in trainable_params)
+    total_count = sum(p.numel() for p in model.parameters())
+    pprint(f"Froze {frozen_count} parameters in action modules.")
+    pprint(f"Trainable parameters: {trainable_count} / {total_count} ({100.0 * trainable_count / total_count:.2f}%)")
+
+
+
+    pprint("\n=== Starting training loop ===")
+    model.train()
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+
+    # Learning rate scheduler with warmup
+    total_steps = num_epochs * len(dataloader)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+    lr_scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+
+    # Generate initial video only on main process
+    if is_main:
+        # For DDP, access underlying model with model.module
+        raw_model = model.module if world_size > 1 else model
+        initial_frame = dataloader.dataset[0]['video_frames'][0]
+        generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4")
+
+    # initialize tqdm progress bar
+    reduced_steps = -1
+    curr_step = 0
+    hyperparams = {
+        "lr": lr,
+        "batch_size": batch_size,
+        "sequence_length": sequence_length,
+        "latent_frames": latent_frames,
+        "epochs": num_epochs,
+        "warmup_steps": warmup_steps,
+        "grad_accum_steps": grad_accum_steps,
+        "effective_batch_size": batch_size * grad_accum_steps * world_size,  # Include world_size
+        "frozen_modules": '_'.join(frozen_modules) if frozen_modules else 'none',
+        "world_size": world_size,  # Track how many GPUs used
+    }
+
+    # TensorBoard writer only on main process
+    writer = None
+    if is_main:
+        run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_sl={hyperparams['sequence_length']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}_fm={'_'.join(hyperparams['frozen_modules'])}_gpus={world_size}"
+        writer = SummaryWriter(log_dir=f"logs/{run_name}")
+
+    for epoch in range(num_epochs):
+        # ==========================================================================
+        # DDP EPOCH SYNC - Set epoch for DistributedSampler
+        # ==========================================================================
+        # This ensures different shuffling each epoch across all GPUs
+        if world_size > 1:
+            dataloader.sampler.set_epoch(epoch)
+
+        # min of len(dataloader) and total_steps
+        prog_bar_steps = len(dataloader) if total_steps < 0 else min(len(dataloader), total_steps)
+
+        # Only show progress bar on main process
+        if is_main:
+            pbar = tqdm(enumerate(dataloader), total=prog_bar_steps)
+        else:
+            pbar = enumerate(dataloader)
+
+        # run training loop with tqdm progress bar
+        for step, batch in pbar:
+            curr_step += 1
+            loss, flow_loss, pred_x0 = train_step(model, vae, batch, scheduler, grad_accum_steps, device)
+
+            if step % grad_accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                lr_scheduler.step()
+
+                # Logging only on main process
+                if is_main:
+                    writer.add_scalar("Loss/train", loss, curr_step)
+                    writer.add_scalar("Flow Loss/train", flow_loss, curr_step)
+                    writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
+                    writer.add_scalar("LR", optimizer.param_groups[0]['lr'], curr_step)
+
+            if is_main:
+                    pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}")
+                    
+            if reduced_steps > 0 and step >= reduced_steps:  # Just run a few steps for demo
+                break
+            if is_main and curr_step % write_video_interval == 0:
+                # For DDP, access underlying model with model.module
+                raw_model = model.module if world_size > 1 else model
+
+                # Generate a video at the end of each epoch
+                initial_frame = dataloader.dataset[np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]
+                vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_s{curr_step}.mp4")
+
+                # Extract first middle and last frames for tensorboard
+                mid_frame = vid[vid.shape[0] // 2]
+                first_frame = vid[0]
+                last_frame = vid[-1]
+                import torchvision.utils as vutils
+                grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2).float() / 255.0, nrow=3)
+                writer.add_image(f"Generated Video Frames", grid, curr_step)
+                vutils.save_image(grid, f"{output_dir}/generated_frames_step{curr_step}.png")
+
+        # Video generation and checkpointing only on main process
+        if is_main:
+            # For DDP, access underlying model with model.module
+            raw_model = model.module if world_size > 1 else model
+
+            # Generate a video at the end of each epoch
+            initial_frame = dataloader.dataset[np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]
+            vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_e{epoch}.mp4")
+
+            # Extract first middle and last frames for tensorboard
+            mid_frame = vid[vid.shape[0] // 2]
+            first_frame = vid[0]
+            last_frame = vid[-1]
+            import torchvision.utils as vutils
+            grid = vutils.make_grid(torch.from_numpy(np.stack([first_frame, mid_frame, last_frame])).permute(0, 3, 1, 2).float() / 255.0, nrow=3)
+            writer.add_image(f"Generated Video Frames", grid, epoch)
+            vutils.save_image(grid, f"{output_dir}/generated_frames_epoch{epoch}.png")
+
+            # Save checkpoint
+            checkpoint_frequency = 1  # save every epoch
+            if (epoch + 1) % checkpoint_frequency == 0:
+                checkpoint_path = f"{output_dir}/finetuned_model_epoch{epoch}.safetensors"
+                os.makedirs("checkpoints", exist_ok=True)
+                from safetensors.torch import save_file
+                # Save the unwrapped model state dict (not DDP wrapper)
+                save_file(raw_model.state_dict(), checkpoint_path)
+                print(f"Saved checkpoint to {checkpoint_path}")
+
+        # ==========================================================================
+        # DDP SYNC - Synchronize all processes at end of epoch
+        # ==========================================================================
+        # This ensures all GPUs finish the epoch before starting the next
+        if world_size > 1:
+            dist.barrier()
+
+    # Final logging only on main process
+    if is_main:
+        writer.add_hparams(hparam_dict=hyperparams, metric_dict={
+            "final_loss": loss,
+            "final_flow_loss": flow_loss,
+        })
+        writer.close()
+
+        print("Training loop complete.")
+        raw_model = model.module if world_size > 1 else model
+        initial_frame = dataloader.dataset[0]['video_frames'][0]
+        generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/final_output.mp4")
+
+    # ==========================================================================
+    # DDP CLEANUP - Clean up distributed processes
+    # ==========================================================================
+    cleanup_distributed()
 
 if __name__ == "__main__":
     main()
