@@ -48,6 +48,7 @@ def parse_args():
 
     # Data settings
     parser.add_argument("--data_dir", type=str, 
+                        #default="/mnt/d/data_640_360_300_sessions",
                         default="/media/kristofe/eight/data",
                         #default="/mnt/s3/uedata",
                         help="Path to training data directory")
@@ -783,6 +784,9 @@ def pprint(str):
         print(str)
 
 def main():
+  # Parse command line arguments
+  args = parse_args()
+
   # ==========================================================================
   # DDP SETUP - Initialize distributed training
   # ==========================================================================
@@ -799,35 +803,33 @@ def main():
   pprint(f"Using device: {device}")
   pprint(f"World size (total GPUs): {world_size}")
 
-  # === SEQUENCE LENGTH CONFIG ===
-  # Choose latent frames: 3, 5, 9, 13, 15, 17, 19, 21 (higher = better temporal consistency but more memory)
-  # With gradient checkpointing on RTX 6000: latent_frames=15 uses ~72GB, latent_frames=19 uses ~98GB
-  latent_frames = 13 
-  num_epochs = 5
-  max_sequences = 400  #9000 # Limit dataset size for quicker testing
-  lr = 1e-6
-  warmup_steps = 100 # 1000
-  write_video_interval = 100
-  enable_gradient_checkpointing = False  # Save ~30-50% memory (20-30% slower)
+  # Get sequence config based on latent_frames and GPU type
+  seq_config = get_sequence_config(
+      args.latent_frames,
+      gpu=args.gpu,
+      gradient_checkpointing=args.gradient_checkpointing
+  )
 
-  seq_config = get_sequence_config(latent_frames, gpu="rtx6000", gradient_checkpointing=enable_gradient_checkpointing)
-
-  pprint(f"\n=== Sequence Config ===")
-  pprint(f"Gradient checkpointing: {enable_gradient_checkpointing}")
-  pprint(f"Latent frames: {seq_config['latent_frames']}")
-  pprint(f"Video frames: {seq_config['video_frames']}")
-  pprint(f"Batch size per GPU: {seq_config['batch_size']}")
-  pprint(f"Grad accum: {seq_config['grad_accum_steps']}")
-  # With DDP, effective batch = batch_size * grad_accum * world_size
-  pprint(f"Effective batch (with {world_size} GPUs): {seq_config['batch_size'] * seq_config['grad_accum_steps'] * world_size}")
-
-  batch_size = seq_config['batch_size']
+  # Allow command-line overrides for batch_size and grad_accum_steps
+  batch_size = args.batch_size if args.batch_size is not None else seq_config['batch_size']
+  grad_accum_steps = args.grad_accum_steps if args.grad_accum_steps is not None else seq_config['grad_accum_steps']
   sequence_length = seq_config['video_frames']
-  grad_accum_steps = seq_config['grad_accum_steps']
 
+  pprint(f"\n=== Training Config ===")
+  pprint(f"Data dir: {args.data_dir}")
+  pprint(f"Max sequences: {args.max_sequences}")
+  pprint(f"Epochs: {args.num_epochs}")
+  pprint(f"Learning rate: {args.lr}")
+  pprint(f"Warmup steps: {args.warmup_steps}")
+  pprint(f"\n=== Sequence Config ===")
+  pprint(f"Gradient checkpointing: {args.gradient_checkpointing}")
+  pprint(f"Latent frames: {args.latent_frames}")
+  pprint(f"Video frames: {sequence_length}")
+  pprint(f"Batch size per GPU: {batch_size}")
+  pprint(f"Grad accum: {grad_accum_steps}")
+  pprint(f"Effective batch (with {world_size} GPUs): {batch_size * grad_accum_steps * world_size}")
 
-  #dataset = SimpleDataset(data_dir="/mnt/s3/uedata", sequence_length=sequence_length, max_sequences=max_sequences)
-  dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
+  dataset = SimpleDataset(data_dir=args.data_dir, sequence_length=sequence_length, max_sequences=args.max_sequences)
 
   # ==========================================================================
   # DDP DATALOADER - Use DistributedSampler for multi-GPU
@@ -850,8 +852,7 @@ def main():
       dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
   pprint("\nLoading model...")
-  # gradient_checkpointing=True saves ~30-50% memory but ~20-30% slower training
-  model, vae = load_model(device, gradient_checkpointing=enable_gradient_checkpointing)
+  model, vae = load_model(device, gradient_checkpointing=args.gradient_checkpointing)
   pprint("Model loaded.")
   # ==========================================================================
   # DDP MODEL WRAPPING - Wrap model with DistributedDataParallel
@@ -872,7 +873,7 @@ def main():
   # creating output folder (only on main process)
   from zoneinfo import ZoneInfo
   timestamp = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d-%H_%M_%S")
-  output_dir = f"outputs/finetune_ddp_{timestamp}"
+  output_dir = args.output_dir if args.output_dir else f"outputs/finetune_ddp_{timestamp}"
   if is_main:
       os.makedirs(output_dir, exist_ok=True)
   pprint(f"Outputs will be saved to: {output_dir}")
@@ -921,13 +922,13 @@ def main():
 
   pprint("\n=== Starting training loop ===")
   model.train()
-  optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+  optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
 
   # Learning rate scheduler with warmup
-  total_steps = num_epochs * len(dataloader)
-  warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
-  cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
-  lr_scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+  total_steps = args.num_epochs * len(dataloader)
+  warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=args.warmup_steps)
+  cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - args.warmup_steps)
+  lr_scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[args.warmup_steps])
 
   # Generate initial video only on main process
   if is_main:
@@ -940,25 +941,26 @@ def main():
   reduced_steps = -1
   curr_step = 0
   hyperparams = {
-    "lr": lr,
+    "lr": args.lr,
     "batch_size": batch_size,
     "sequence_length": sequence_length,
-    "latent_frames": latent_frames,
-    "epochs": num_epochs,
-    "warmup_steps": warmup_steps,
+    "latent_frames": args.latent_frames,
+    "epochs": args.num_epochs,
+    "warmup_steps": args.warmup_steps,
     "grad_accum_steps": grad_accum_steps,
-    "effective_batch_size": batch_size * grad_accum_steps * world_size,  # Include world_size
+    "effective_batch_size": batch_size * grad_accum_steps * world_size,
+    "gradient_checkpointing": args.gradient_checkpointing,
     "frozen_modules": '_'.join(frozen_modules) if frozen_modules else 'none',
-    "world_size": world_size,  # Track how many GPUs used
+    "world_size": world_size,
   }
 
   # TensorBoard writer only on main process
   writer = None
   if is_main:
-      run_name = f"{timestamp}_lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_sl={hyperparams['sequence_length']}_ga={hyperparams['grad_accum_steps']}_ws={hyperparams['warmup_steps']}_gpus={world_size}"
+      run_name = f"{timestamp}_lr={args.lr}_bs={batch_size}_ep={args.num_epochs}_lf={args.latent_frames}_ga={grad_accum_steps}_ws={args.warmup_steps}_gpus={world_size}"
       writer = SummaryWriter(log_dir=f"logs/{run_name}")
 
-  for epoch in range(num_epochs):
+  for epoch in range(args.num_epochs):
     # ==========================================================================
     # DDP EPOCH SYNC - Set epoch for DistributedSampler
     # ==========================================================================
@@ -997,7 +999,7 @@ def main():
                 
         if reduced_steps > 0 and step >= reduced_steps:  # Just run a few steps for demo
             break
-        if is_main and curr_step % write_video_interval == 0:
+        if is_main and curr_step % args.write_video_interval == 0:
             # For DDP, access underlying model with model.module
             raw_model = model.module if world_size > 1 else model
 
@@ -1033,8 +1035,7 @@ def main():
         vutils.save_image(grid, f"{output_dir}/generated_frames_epoch{epoch}.png")
 
         # Save checkpoint
-        checkpoint_frequency = 1  # save every epoch
-        if (epoch + 1) % checkpoint_frequency == 0:
+        if (epoch + 1) % args.checkpoint_frequency == 0:
             checkpoint_path = f"{output_dir}/finetuned_model_epoch{epoch}.safetensors"
             os.makedirs("checkpoints", exist_ok=True)
             from safetensors.torch import save_file
