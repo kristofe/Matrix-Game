@@ -594,7 +594,28 @@ def main():
 
     #freeze action modules - preserve learned action-video mapping
     frozen_count = 0
-    frozen_modules = ['action_model']
+    frozen_modules = [
+        'patch_embedding',      # Spatial feature extraction
+        'img_emb',              # CLIP visual context
+        'time_embedding',       # Diffusion timestep encoding
+        'time_projection',      # Time modulation
+        'blocks.0.',            # First 15 transformer blocks
+        'blocks.1.',
+        'blocks.2.',
+        'blocks.3.',
+        'blocks.4.',
+        'blocks.5.',
+        'blocks.6.',
+        'blocks.7.',
+        'blocks.8.',
+        'blocks.9.',
+        'blocks.10.',
+        'blocks.11.',
+        'blocks.12.',
+        'blocks.13.',
+        'blocks.14.',
+    ]
+
     for name, param in model.named_parameters():
         if any(fm in name for fm in frozen_modules):
             param.requires_grad = False
