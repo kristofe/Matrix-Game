@@ -11,7 +11,7 @@ def parse_config(config, mode="universal"):
     - config: list_actions[i] 的配置
     - 返回: key_data 和 mouse_data
     """
-    assert mode in ['universal', 'gta_drive', 'templerun']
+    assert mode in ['universal', 'gta_drive', 'unreal', 'templerun']
     key_data = {}
     mouse_data = {}
     if mode != 'templerun':

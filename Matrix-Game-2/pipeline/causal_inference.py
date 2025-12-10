@@ -42,7 +42,7 @@ def get_current_action(mode="universal"):
                 pass
         mouse_cond = torch.tensor(CAMERA_VALUE_MAP[idx_mouse]).cuda()
         keyboard_cond = torch.tensor(KEYBOARD_IDX[idx_keyboard]).cuda()
-    elif mode == 'gta_drive':
+    elif mode == 'gta_drive' or mode == 'unreal':
         print()
         print('-'*30)
         print("PRESS [W, S, A, D, Q] FOR MOVEMENT\n (W: forward, S: back, A: left, D: right, Q: no move)")
