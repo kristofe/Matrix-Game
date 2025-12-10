@@ -21,6 +21,7 @@ If you're on a cluster with SLURM:
 """
 
 from datetime import datetime
+import argparse
 import torch
 import os
 
@@ -40,6 +41,54 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from utils.visualize import process_video
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="DDP-enabled finetuning for Matrix-Game-2")
+
+    # Data settings
+    parser.add_argument("--data_dir", type=str, 
+                        default="/media/kristofe/eight/data",
+                        #default="/mnt/s3/uedata",
+                        help="Path to training data directory")
+    parser.add_argument("--max_sequences", type=int, default=400,
+                        help="Max sequences to use from dataset (-1 for all)")
+
+    # Training hyperparameters
+    parser.add_argument("--num_epochs", type=int, default=5,
+                        help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-6,
+                        help="Learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=100,
+                        help="Number of warmup steps for LR scheduler")
+
+    # Sequence/memory settings
+    parser.add_argument("--latent_frames", type=int, default=13,
+                        help="Number of latent frames (video_frames = 1 + 4*(latent_frames-1))")
+    parser.add_argument("--gpu", type=str, default="rtx6000", choices=["a100", "rtx6000"],
+                        help="GPU type for memory config")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing (saves ~30-50%% memory, ~20-30%% slower)")
+
+    # Batch size overrides (optional - auto-configured if not specified)
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Override batch size (default: auto from latent_frames)")
+    parser.add_argument("--grad_accum_steps", type=int, default=None,
+                        help="Override gradient accumulation steps (default: auto)")
+
+    # Logging/output settings
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Output directory (default: outputs/finetune_ddp_<timestamp>)")
+    parser.add_argument("--write_video_interval", type=int, default=100,
+                        help="Generate video every N steps")
+    parser.add_argument("--checkpoint_frequency", type=int, default=1,
+                        help="Save checkpoint every N epochs")
+
+    # Model settings
+    parser.add_argument("--checkpoint_path", type=str, default="",
+                        help="Path to checkpoint to resume from")
+
+    return parser.parse_args()
 
 # ============================================================================
 # DDP (Distributed Data Parallel) IMPORTS
@@ -753,13 +802,13 @@ def main():
   # === SEQUENCE LENGTH CONFIG ===
   # Choose latent frames: 3, 5, 9, 13, 15, 17, 19, 21 (higher = better temporal consistency but more memory)
   # With gradient checkpointing on RTX 6000: latent_frames=15 uses ~72GB, latent_frames=19 uses ~98GB
-  latent_frames = 9 
+  latent_frames = 13 
   num_epochs = 5
   max_sequences = 400  #9000 # Limit dataset size for quicker testing
   lr = 1e-6
   warmup_steps = 100 # 1000
   write_video_interval = 100
-  enable_gradient_checkpointing = True  # Save ~30-50% memory (20-30% slower)
+  enable_gradient_checkpointing = False  # Save ~30-50% memory (20-30% slower)
 
   seq_config = get_sequence_config(latent_frames, gpu="rtx6000", gradient_checkpointing=enable_gradient_checkpointing)
 
@@ -821,7 +870,8 @@ def main():
   scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
 
   # creating output folder (only on main process)
-  timestamp = datetime.now().strftime("%Y%m%d-%H_%M_%S")
+  from zoneinfo import ZoneInfo
+  timestamp = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d-%H_%M_%S")
   output_dir = f"outputs/finetune_ddp_{timestamp}"
   if is_main:
       os.makedirs(output_dir, exist_ok=True)
@@ -834,7 +884,28 @@ def main():
 
   #freeze action modules - preserve learned action-video mapping
   frozen_count = 0
-  frozen_modules = ['action_model']
+  frozen_modules = [
+        'patch_embedding',      # Spatial feature extraction
+        'img_emb',              # CLIP visual context
+        'time_embedding',       # Diffusion timestep encoding
+        'time_projection',      # Time modulation
+        'blocks.0.',            # First 15 transformer blocks
+        'blocks.1.',
+        'blocks.2.',
+        'blocks.3.',
+        'blocks.4.',
+        'blocks.5.',
+        'blocks.6.',
+        'blocks.7.',
+        'blocks.8.',
+        'blocks.9.',
+        'blocks.10.',
+        'blocks.11.',
+        'blocks.12.',
+        'blocks.13.',
+        'blocks.14.',
+        'action_model',
+    ]
   for name, param in model.named_parameters():
       if any(fm in name for fm in frozen_modules):
           param.requires_grad = False
@@ -884,7 +955,7 @@ def main():
   # TensorBoard writer only on main process
   writer = None
   if is_main:
-      run_name = f"lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_sl={hyperparams['sequence_length']}_ga={hyperparams['grad_accum_steps']}_ts={timestamp}_ws={hyperparams['warmup_steps']}_fm={'_'.join(hyperparams['frozen_modules'])}_gpus={world_size}"
+      run_name = f"{timestamp}_lr={hyperparams['lr']}_bs={hyperparams['batch_size']}_ep={hyperparams['epochs']}_sl={hyperparams['sequence_length']}_ga={hyperparams['grad_accum_steps']}_ws={hyperparams['warmup_steps']}_gpus={world_size}"
       writer = SummaryWriter(log_dir=f"logs/{run_name}")
 
   for epoch in range(num_epochs):
