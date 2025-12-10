@@ -8,7 +8,7 @@
     "heads_num": 16,
     "hidden_size": 128,
     "img_hidden_size": 1536,
-    "keyboard_dim_in": 2,
+    "keyboard_dim_in": 4,
     "keyboard_hidden_dim": 1024,
     "mouse_dim_in": 2,
     "mouse_hidden_dim": 1024,

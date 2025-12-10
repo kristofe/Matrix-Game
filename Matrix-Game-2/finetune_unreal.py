@@ -139,8 +139,9 @@ class SimpleDataset(Dataset):
         """
         Convert steering/throttle/brake to Unreal format.
 
-        Unreal mode expects (like GTA):
-        - keyboard_condition: [forward, back] - 2D binary
+        Unreal mode expects:
+        - keyboard_condition: [forward, back, left, right] - 4D (to match checkpoint)
+          We only use forward/back for gas/brake, left/right are zeroed
         - mouse_condition: [vertical, horizontal] - 2D continuous (horizontal = steering)
 
         Args:
@@ -149,13 +150,15 @@ class SimpleDataset(Dataset):
             brake: 0 to 1
 
         Returns:
-            keyboard: [forward, back]
+            keyboard: [forward, back, left, right] - 4D to match checkpoint
             mouse: [vertical, horizontal]
         """
-        # Keyboard - binary actions for gas/brake
+        # Keyboard - 4D to match checkpoint, but only use forward/back
         keyboard = [
             1.0 if throttle > 0.1 else 0.0,  # forward (gas)
             1.0 if brake > 0.1 else 0.0,      # back (brake)
+            0.0,                              # left (unused, steering via mouse)
+            0.0,                              # right (unused, steering via mouse)
         ]
 
         # Mouse - steering control (scaled by 0.1 like in conditions.py)
@@ -191,7 +194,7 @@ class SimpleDataset(Dataset):
 
         return {
             'video_frames': torch.stack(frames),                                      # [T, H, W, C]
-            'keyboard_actions': torch.tensor(keyboard_actions, dtype=torch.float32),  # [T, 2]
+            'keyboard_actions': torch.tensor(keyboard_actions, dtype=torch.float32),  # [T, 4]
             'mouse_actions': torch.tensor(mouse_actions, dtype=torch.float32),        # [T, 2]
         }
 # ============================================================================
@@ -232,12 +235,10 @@ def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, d
     Args:
         model: the trained diffusion model
         vae: the VAE for encoding/decoding
-        scheduler: the diffusion scheduler
         initial_frame: [1, C, H, W] tensor, initial frame in [-1, 1]
-        keyboard_actions: [num_action_steps, 2] tensor (forward, back)
+        keyboard_actions: [num_action_steps, 4] tensor (forward, back, left, right)
         mouse_actions: [num_action_steps, 2] tensor, (vertical, horizontal/steering) scaled by 0.1
         device: torch device
-        num_inference_steps: number of diffusion steps
     '''
     from einops import rearrange
     from pipeline import CausalInferencePipeline
@@ -338,7 +339,7 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
 
     # Create constant actions (driving forward with slight steering)
     num_action_steps = 89
-    keyboard = torch.zeros(num_action_steps, 2)
+    keyboard = torch.zeros(num_action_steps, 4)  # 4D to match checkpoint
     keyboard[:, 0] = 1  # forward (gas)
 
     # Steer in a sinusoidal pattern
@@ -360,7 +361,7 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
 
     # Build config tuple (keyboard_actions, mouse_actions)
     config = (
-        keyboard.cpu().numpy(),  # [num_action_steps, 2]
+        keyboard.cpu().numpy(),  # [num_action_steps, 4]
         mouse.cpu().numpy()      # [num_action_steps, 2]
     )
 

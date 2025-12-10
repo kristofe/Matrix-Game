@@ -25,7 +25,12 @@ def parse_config(config, mode="universal"):
             still, w, s, left, right, a, d = key[i]
         elif mode == 'universal':
             w, s, a, d = key[i]
+        elif mode == 'unreal':
+            # Unreal: 4D keyboard [forward, back, left, right], but A/D from mouse steering
+            w, s = key[i][0], key[i][1]
+            a, d = mouse[i][1] < 0, mouse[i][1] > 0
         else:
+            # gta_drive: 2D keyboard [forward, back], A/D from mouse steering
             w, s, a, d = key[i][0], key[i][1], mouse[i][1] < 0, mouse[i][1] > 0
         if mode == 'universal':
             mouse_y, mouse_x = mouse[i]
