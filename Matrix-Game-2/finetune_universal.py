@@ -19,6 +19,7 @@ import os
 
 # Memory optimization for CUDA - reduces fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+torch.cuda.init()
 import glob
 import csv
 import numpy as np
@@ -52,6 +53,7 @@ def setup_distributed():
         local_rank = int(os.environ['LOCAL_RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
         dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        print(f"Initialized distributed process group: rank {rank}, local_rank {local_rank}, world_size {world_size}")
         torch.cuda.set_device(local_rank)
         return rank, local_rank, world_size
     else:
@@ -537,8 +539,8 @@ def main():
     sequence_length = seq_config['video_frames']
     grad_accum_steps = seq_config['grad_accum_steps']
 
-    dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
-    # dataset = SimpleDataset(data_dir="/mnt/d/data_640_360_300_sessions", sequence_length=sequence_length, max_sequences=max_sequences)
+    #dataset = SimpleDataset(data_dir="/media/kristofe/eight/data", sequence_length=sequence_length, max_sequences=max_sequences)
+    dataset = SimpleDataset(data_dir="/mnt/d/data_640_360_300_sessions", sequence_length=sequence_length, max_sequences=max_sequences)
 
     # ==========================================================================
     # DDP DATALOADER - Use DistributedSampler for multi-GPU
@@ -594,7 +596,27 @@ def main():
 
     #freeze action modules - preserve learned action-video mapping
     frozen_count = 0
-    frozen_modules = ['action_model']
+    frozen_modules = [
+        'patch_embedding',      # Spatial feature extraction
+        'img_emb',              # CLIP visual context
+        'time_embedding',       # Diffusion timestep encoding
+        'time_projection',      # Time modulation
+        'blocks.0.',            # First 15 transformer blocks
+        'blocks.1.',
+        'blocks.2.',
+        'blocks.3.',
+        'blocks.4.',
+        'blocks.5.',
+        'blocks.6.',
+        'blocks.7.',
+        'blocks.8.',
+        'blocks.9.',
+        'blocks.10.',
+        'blocks.11.',
+        'blocks.12.',
+        'blocks.13.',
+        'blocks.14.',
+    ]
     for name, param in model.named_parameters():
         if any(fm in name for fm in frozen_modules):
             param.requires_grad = False
