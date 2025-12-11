@@ -25,6 +25,9 @@ import argparse
 import torch
 import os
 
+#bugfix on wsl linux
+if torch.cuda.is_available():
+    torch.cuda.init()
 # Memory optimization for CUDA - reduces fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import glob
