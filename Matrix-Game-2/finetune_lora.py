@@ -13,6 +13,17 @@ Example with 2 GPUs:
 For single GPU:
     python finetune_lora.py
 
+
+######################
+# OVERFITTING MODE
+######################
+
+# Train on 7 consecutive 3-frame blocks (= 21 latent frames worth of video)
+python finetune_lora.py --latent_frames 3 --overfit --overfit_blocks 7
+
+# Train on 23 consecutive blocks (= 69 latent frames worth of data)
+python finetune_lora.py --latent_frames 3 --overfit --overfit_blocks 23
+
 LoRA-specific arguments:
     --lora_rank: Rank of LoRA matrices (default: 64)
     --lora_alpha: Scaling factor (default: 128)
@@ -59,6 +70,10 @@ def parse_args():
                         help="Path to training data directory")
     parser.add_argument("--max_sequences", type=int, default=-1,
                         help="Max sequences to use from dataset (-1 for all)")
+    parser.add_argument("--overfit", action="store_true",
+                        help="Overfit on single sequence (debug mode - repeats first sequence 100 times)")
+    parser.add_argument("--overfit_blocks", type=int, default=0,
+                        help="Overfit mode: create N consecutive 3-frame blocks from first run (0=disabled, requires --overfit)")
 
     # Training hyperparameters
     parser.add_argument("--num_epochs", type=int, default=50,
@@ -81,8 +96,8 @@ def parse_args():
                         help="Which layers to inject LoRA into: 'all', 'cross_attn', 'self_attn', 'ffn', or comma-separated combo (e.g., 'cross_attn,ffn')")
 
     # Sequence/memory settings
-    parser.add_argument("--latent_frames", type=int, default=18,
-                        help="Number of latent frames (video_frames = 1 + 4*(latent_frames-1))")
+    parser.add_argument("--latent_frames", type=int, default=3,
+                        help="Number of latent frames. Must be divisible by 3 (num_frame_per_block). Valid: 3,6,9,12,15,18,21. video_frames = 1 + 4*(latent_frames-1)")
     parser.add_argument("--gpu", type=str, default="rtx6000", choices=["a100", "rtx6000"],
                         help="GPU type for memory config")
     parser.add_argument("--gradient_checkpointing", action="store_true",
@@ -364,8 +379,10 @@ def is_main_process():
     return True
 
 class SimpleDataset(Dataset):
-  def __init__(self, data_dir, sequence_length=9, max_sequences=-1):
+  def __init__(self, data_dir, sequence_length=9, max_sequences=-1, overfit=False, overfit_blocks=0):
       self.sequence_length = sequence_length
+      self.overfit = overfit
+      self.overfit_blocks = overfit_blocks
 
       # Find all runs
       self.runs = []
@@ -389,12 +406,42 @@ class SimpleDataset(Dataset):
           num_seq = len(run['frames']) - sequence_length + 1
           for start in range(num_seq):
               self.sequences.append((run_idx, start))
-      
+
       print(f"Total sequences: {len(self.sequences)}")
       #only take max_sequences if specified
       if max_sequences > 0:
           self.sequences = self.sequences[:max_sequences]
       print(f"subsampled sequences: {len(self.sequences)}")
+
+      # Overfit mode: create consecutive blocks from first run
+      if self.overfit and len(self.sequences) > 0:
+          if self.overfit_blocks > 0:
+              # Get first run info
+              first_run_idx = self.sequences[0][0]
+              first_run = self.runs[first_run_idx]
+              num_frames_available = len(first_run['frames'])
+
+              # Create consecutive non-overlapping blocks
+              # Each block is sequence_length video frames (9 frames = 3 latent frames)
+              # Blocks start at frame 0, 8, 16, 24... (stride = sequence_length - 1 = 8)
+              stride = self.sequence_length - 1  # 8 for 9-frame sequences
+              consecutive_sequences = []
+              for block_idx in range(self.overfit_blocks):
+                  start_frame = block_idx * stride
+                  if start_frame + self.sequence_length <= num_frames_available:
+                      consecutive_sequences.append((first_run_idx, start_frame))
+
+              if len(consecutive_sequences) < self.overfit_blocks:
+                  print(f"WARNING: Only {len(consecutive_sequences)} blocks available (requested {self.overfit_blocks})")
+                  print(f"  Need {self.overfit_blocks * stride + 1} frames, have {num_frames_available}")
+
+              # Repeat these consecutive blocks 100 times for overfitting
+              self.sequences = consecutive_sequences * 100
+              print(f"OVERFIT MODE: {len(consecutive_sequences)} consecutive blocks, repeated 100x = {len(self.sequences)} sequences")
+          else:
+              # Original overfit: just repeat first sequence
+              self.sequences = [self.sequences[0]] * 100
+              print(f"OVERFIT MODE: repeating first sequence 100 times")
 
   def _load_csv(self, csv_path):
       """Load steering/throttle per frame"""
@@ -436,7 +483,7 @@ class SimpleDataset(Dataset):
           mouse: [vertical, horizontal]
       """
       keyboard = [
-        throttle,  # forward - use actual throttle value (0-1) instead of binary
+        throttle * 0.5,  # forward - use actual throttle value (0-1) instead of binary
         brake      # back - use actual brake value (0-1) instead of binary
       ]
       mouse = [
@@ -477,27 +524,61 @@ class SimpleDataset(Dataset):
           'mouse_actions': torch.tensor(mouse_actions, dtype=torch.float32),        # [T, 2] = [9, 2] (vertical, horizontal/steering)
       }
 
-def visualize_sequence_grid(sample, output_path="sequence_grid.png", thumb_size=64):
+def visualize_training_sequence(dataset, output_path="sequence_grid.png", thumb_size=64, overfit_blocks=0):
     """
-    Create a grid visualization of frames from a dataset sequence.
+    Visualize training sequence(s) as a grid image and video.
+
+    In regular mode: visualizes first sample from dataset.
+    In overfit_blocks mode: chains consecutive blocks together to show full sequence.
 
     Args:
-        sample: Dict with 'video_frames' tensor of shape [T, H, W, C] in range [-1, 1]
-        output_path: Path to save the grid image
+        dataset: SimpleDataset instance
+        output_path: Path to save the grid image (video saved with same base name + .mp4)
         thumb_size: Size of each thumbnail (will be thumb_size x thumb_size * aspect_ratio)
+        overfit_blocks: Number of consecutive blocks to chain (0 = use single sample)
 
     Returns:
         PIL Image of the grid
     """
     from PIL import Image
     import math
+    import torchvision.io
 
-    frames = sample['video_frames']  # [T, H, W, C] in [-1, 1]
+    # Get frames - either single sample or chained blocks
+    if overfit_blocks > 0:
+        # Chain consecutive blocks together
+        num_blocks_available = len(dataset.sequences) // 100  # sequences repeat 100x
+        num_blocks_to_use = min(overfit_blocks, num_blocks_available)
+
+        all_frames = []
+        for i in range(num_blocks_to_use):
+            sample = dataset[i]
+            block_frames = sample['video_frames']  # [T, H, W, C]
+            # Remove overlap frame (last frame) except for final block
+            if i < num_blocks_to_use - 1:
+                block_frames = block_frames[:-1]
+            all_frames.append(block_frames)
+
+        frames = torch.cat(all_frames, dim=0)  # [total_T, H, W, C]
+        print(f"Chained {num_blocks_to_use} blocks: {len(all_frames)} segments -> {frames.shape[0]} total frames")
+    else:
+        # Regular mode: single sample
+        sample = dataset[0]
+        frames = sample['video_frames']  # [T, H, W, C] in [-1, 1]
+
     T, H, W, C = frames.shape
 
     # Convert from [-1, 1] to [0, 255]
     frames_uint8 = ((frames + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
 
+    # === Save as video ===
+    base_path = output_path.rsplit('.', 1)[0]  # Remove extension
+    video_path = f"{base_path}.mp4"
+    video_tensor = torch.from_numpy(frames_uint8)  # [T, H, W, C]
+    torchvision.io.write_video(video_path, video_tensor, fps=25)
+    print(f"Saved sequence video ({T} frames) to {video_path}")
+
+    # === Create grid image ===
     # Calculate thumbnail dimensions preserving aspect ratio
     aspect = W / H
     thumb_h = thumb_size
@@ -594,38 +675,45 @@ def get_sequence_config(latent_frames, gpu="rtx6000", gradient_checkpointing=Fal
     """
     video_frames = 1 + 4 * (latent_frames - 1)
 
+    # IMPORTANT: latent_frames must be divisible by num_frame_per_block (hardcoded to 3)
+    # Valid values: 3, 6, 9, 12, 15, 18, 21, 24, ...
+    # video_frames = 1 + 4*(latent-1): 3->9, 6->21, 9->33, 12->45, 15->57, 18->69, 21->81
+    if latent_frames % 3 != 0:
+        print(f"WARNING: latent_frames={latent_frames} is not divisible by 3 (num_frame_per_block).")
+        print(f"         This may cause issues during inference. Consider using 3, 6, 9, 12, 15, 18, or 21.")
+
     if gradient_checkpointing:
         # With gradient checkpointing: ~30-50% memory savings
-        # Measured on RTX 6000 (96GB): 15 frames=72GB, 17/19/21=OOM
+        # latent_frames must be divisible by 3 (num_frame_per_block)
         configs = {
             "a100": {  # 40GB - checkpointing enables longer sequences
-                3:  {"batch_size": 3, "grad_accum": 4},   # ~25GB
-                5:  {"batch_size": 2, "grad_accum": 6},   # ~30GB
-                9:  {"batch_size": 1, "grad_accum": 12},  # ~35GB
+                3:  {"batch_size": 3, "grad_accum": 4},   # ~25GB, video=9 frames
+                6:  {"batch_size": 2, "grad_accum": 6},   # ~32GB, video=21 frames
+                9:  {"batch_size": 1, "grad_accum": 12},  # ~38GB, video=33 frames
             },
             "rtx6000": {  # 96GB
-                3:  {"batch_size": 6, "grad_accum": 2},   # ~25GB
-                5:  {"batch_size": 4, "grad_accum": 3},   # ~40GB
-                9:  {"batch_size": 3, "grad_accum": 5},   # ~55GB
-                11: {"batch_size": 2, "grad_accum": 4},   # ~65GB
-                13: {"batch_size": 2, "grad_accum": 6},   # ~70GB
-                15: {"batch_size": 1, "grad_accum": 12},  # ~72GB (measured) 
-                17: {"batch_size": 1, "grad_accum": 12},  # ~88GB (measured) - MAX for 96GB
-                # 17, 19, 21 cause OOM on 96GB even with checkpointing
+                3:  {"batch_size": 6, "grad_accum": 2},   # ~25GB, video=9 frames
+                6:  {"batch_size": 4, "grad_accum": 3},   # ~42GB, video=21 frames
+                9:  {"batch_size": 3, "grad_accum": 4},   # ~55GB, video=33 frames
+                12: {"batch_size": 2, "grad_accum": 6},   # ~68GB, video=45 frames
+                15: {"batch_size": 1, "grad_accum": 12},  # ~75GB, video=57 frames
+                18: {"batch_size": 1, "grad_accum": 12},  # ~88GB, video=69 frames - MAX for 96GB
+                # 21+ causes OOM on 96GB even with checkpointing
             },
         }
     else:
         # Without gradient checkpointing (faster but more memory)
+        # latent_frames must be divisible by 3 (num_frame_per_block)
         configs = {
             "a100": {  # 40GB
-                3:  {"batch_size": 2, "grad_accum": 6},
-                5:  {"batch_size": 1, "grad_accum": 12},
+                3:  {"batch_size": 2, "grad_accum": 6},   # ~30GB, video=9 frames
+                6:  {"batch_size": 1, "grad_accum": 12},  # ~38GB, video=21 frames
             },
             "rtx6000": {  # 96GB
-                3:  {"batch_size": 4, "grad_accum": 3},   # ~35GB
-                5:  {"batch_size": 3, "grad_accum": 4},   # ~55GB
-                9:  {"batch_size": 2, "grad_accum": 6},   # ~85GB
-                11: {"batch_size": 1, "grad_accum": 12},  # ~96GB (barely fits and might crash)
+                3:  {"batch_size": 4, "grad_accum": 3},   # ~35GB, video=9 frames
+                6:  {"batch_size": 3, "grad_accum": 4},   # ~55GB, video=21 frames
+                9:  {"batch_size": 2, "grad_accum": 6},   # ~75GB, video=33 frames
+                12: {"batch_size": 1, "grad_accum": 12},  # ~92GB, video=45 frames (tight fit)
             },
         }
 
@@ -649,8 +737,9 @@ def train_step(model, vae, batch, scheduler, accumulation_steps, device ):
 
     with torch.no_grad():
         latents = vae.encode(frames, device=device).to(dtype=torch.bfloat16)
-        visual_context = vae.clip.encode_video(frames).to(device=device, dtype=torch.bfloat16)
-        raw_model.model.num_frame_per_block = latents.shape[2]
+        first_frame = frames[:, :, :1, :, :]  # [B, C, 1, H, W]
+        visual_context = vae.clip.encode_video(first_frame).to(device=device, dtype=torch.bfloat16)
+        raw_model.model.num_frame_per_block = 3 # its always 3 latents.shape[2]
 
     # Free frames early - no longer needed after encoding
     del frames
@@ -668,15 +757,23 @@ def train_step(model, vae, batch, scheduler, accumulation_steps, device ):
     cond_concat = torch.cat([mask_cond, latents], dim=1)
 
     #sample random timestep
+    # t_scalar is in [0.05, 0.95] representing sigma interpolation
+    # scheduler.timesteps are in [0, num_train_timesteps] range
+    # We need to scale t_scalar to match the timesteps range for add_noise
     batch_size = latents.shape[0]
-    t_scalar = torch.rand(1,device=device) *0.9 + 0.05  #avoid 0 and 1
-    t = t_scalar.expand(batch_size)
+    t_scalar = torch.rand(1, device=device) * 0.9 + 0.05  # [0.05, 0.95] avoid extremes
+
+    # Scale to timestep range for scheduler.add_noise (expects values matching self.timesteps)
+    # self.timesteps = self.sigmas * num_train_timesteps, so we scale accordingly
+    t_scaled = t_scalar * scheduler.num_train_timesteps  # [50, 950] for 1000 timesteps
+
+    # For model forward pass, use scaled timestep
+    t = t_scaled.expand(batch_size)
     timestep = t.unsqueeze(1).expand(batch_size, num_latent_frames).to(dtype=torch.bfloat16)
 
-    #add noise
-    #per sample timesteps (different noise levels per sample)
+    #add noise using scaled timestep
     noise = torch.randn_like(latents)
-    noisy_latents = scheduler.add_noise(latents, noise, t_scalar)
+    noisy_latents = scheduler.add_noise(latents, noise, t_scaled)
 
     #forward pass
     conditional_dict = {
@@ -742,7 +839,7 @@ def test_logic(dataloader, model, vae, scheduler, device):
 
     # Encode
     latents = vae.encode(frames, device=device)
-    model.model.num_frame_per_block = latents.shape[2]
+    model.model.num_frame_per_block = 3 # its always 3.  latents.shape[2]
 
     print(f"Input frames shape: {frames.shape}")
     print(f"Latents shape: {latents.shape}") 
@@ -936,6 +1033,98 @@ def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, d
 
     return video
 
+def get_chained_block_data(dataset, num_blocks):
+    """
+    Chain consecutive blocks together for longer video generation.
+
+    When using overfit_blocks mode, the dataset contains consecutive 3-latent-frame
+    sequences from the same video. This function chains them together by:
+    1. Getting each block's actions
+    2. Removing the overlap frame between blocks (stride = sequence_length - 1)
+    3. Returning concatenated actions and the initial frame
+
+    Args:
+        dataset: SimpleDataset with consecutive block sequences
+        num_blocks: Number of blocks to chain together
+
+    Returns:
+        dict with:
+            - initial_frame: First frame from first block
+            - keyboard_actions: Concatenated keyboard actions
+            - mouse_actions: Concatenated mouse actions
+            - num_output_frames: Total latent frames (3 per block)
+    """
+    num_blocks_available = len(dataset.sequences) // 100  # sequences repeat 100x
+    num_blocks_to_use = min(num_blocks, num_blocks_available)
+
+    all_keyboard = []
+    all_mouse = []
+    for i in range(num_blocks_to_use):
+        sample = dataset[i]  # Gets block i (sequences repeat 100x)
+        all_keyboard.append(sample['keyboard_actions'])
+        all_mouse.append(sample['mouse_actions'])
+
+    # Concatenate actions (removing overlap frame between blocks)
+    # Each block has sequence_length video frames of actions
+    # Blocks overlap by 1 frame, so remove last frame except for final block
+    keyboard_actions = torch.cat([k[:-1] if i < len(all_keyboard)-1 else k for i, k in enumerate(all_keyboard)])
+    mouse_actions = torch.cat([m[:-1] if i < len(all_mouse)-1 else m for i, m in enumerate(all_mouse)])
+
+    # Use first frame from first block
+    initial_frame = dataset[0]['video_frames'][0]
+
+    # 3 latent frames per block
+    num_output_frames = 3 * num_blocks_to_use
+
+    return {
+        'initial_frame': initial_frame,
+        'keyboard_actions': keyboard_actions,
+        'mouse_actions': mouse_actions,
+        'num_output_frames': num_output_frames
+    }
+
+def generate_training_video(model, vae, dataset, device, output_path, overfit_blocks=0):
+    """
+    Generate a video from training data for evaluation.
+
+    Handles both regular mode (single sample) and overfit_blocks mode
+    (chained consecutive blocks for longer video).
+
+    Args:
+        model: The diffusion model
+        vae: VAE encoder/decoder
+        dataset: SimpleDataset instance
+        device: torch device
+        output_path: Path to save the video
+        overfit_blocks: Number of consecutive blocks to chain (0 = use single sample)
+
+    Returns:
+        vid: Generated video array [T, H, W, C]
+        icons_vid: Video with icons overlay
+    """
+    if overfit_blocks > 0:
+        # Chain consecutive blocks for longer video generation
+        block_data = get_chained_block_data(dataset, overfit_blocks)
+        vid, icons_vid = generate_video_file(
+            model, vae, block_data['initial_frame'], device,
+            path=output_path,
+            keyboard_actions=block_data['keyboard_actions'],
+            mouse_actions=block_data['mouse_actions'],
+            num_output_frames=block_data['num_output_frames'])
+    else:
+        # Regular mode: use first sample
+        sample = dataset[0]
+        initial_frame = sample['video_frames'][0]
+        keyboard_actions = sample['keyboard_actions']
+        mouse_actions = sample['mouse_actions']
+        vid, icons_vid = generate_video_file(
+            model, vae, initial_frame, device,
+            path=output_path,
+            keyboard_actions=keyboard_actions,
+            mouse_actions=mouse_actions)
+
+    return vid, icons_vid
+
 def generate_video_file(model, vae, initial_frame, device, path="output.mp4", keyboard_actions=None, mouse_actions=None, num_output_frames=21):
     from PIL import Image
     import numpy as np
@@ -1098,7 +1287,7 @@ def main():
   pprint(f"Grad accum: {grad_accum_steps}")
   pprint(f"Effective batch (with {world_size} GPUs): {batch_size * grad_accum_steps * world_size}")
 
-  dataset = SimpleDataset(data_dir=args.data_dir, sequence_length=sequence_length, max_sequences=args.max_sequences)
+  dataset = SimpleDataset(data_dir=args.data_dir, sequence_length=sequence_length, max_sequences=args.max_sequences, overfit=args.overfit, overfit_blocks=args.overfit_blocks)
 
   # ==========================================================================
   # DDP DATALOADER - Use DistributedSampler for multi-GPU
@@ -1121,9 +1310,9 @@ def main():
       dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
   if is_main:
-    # Get a sample from the dataset
-    sample = dataset[0]
-    visualize_sequence_grid(sample, "my_sequence_small.png", thumb_size=128)
+    # Visualize training sequence (handles both regular and overfit_blocks modes)
+    visualize_training_sequence(dataset, f"{output_dir}/training_sequence.png",
+                                 thumb_size=128, overfit_blocks=args.overfit_blocks)
 
   pprint("\nLoading model...")
   model, vae = load_model(device, gradient_checkpointing=args.gradient_checkpointing)
@@ -1166,6 +1355,8 @@ def main():
 
   pprint("Creating scheduler...")
   scheduler = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+  # Set timesteps for training (1000 steps for full resolution)
+  scheduler.set_timesteps(1000, training=True)
 
   # creating output folder (only on main process)
   from zoneinfo import ZoneInfo
@@ -1196,11 +1387,9 @@ def main():
   if is_main:
       # For DDP, access underlying model with model.module
       raw_model = model.module if world_size > 1 else model
-      sample = dataloader.dataset[0]
-      initial_frame = sample['video_frames'][0]
-      keyboard_actions = sample['keyboard_actions']
-      mouse_actions = sample['mouse_actions']
-      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.latent_frames)
+      generate_training_video(raw_model, vae, dataloader.dataset, device,
+                              output_path=f"{output_dir}/initial_output.mp4",
+                              overfit_blocks=args.overfit_blocks)
 
   # initialize tqdm progress bar
   reduced_steps = -1
@@ -1281,11 +1470,9 @@ def main():
             raw_model.eval()
 
             # Generate a video using same initial frame and actions from training data
-            sample = dataloader.dataset[0]
-            initial_frame = sample['video_frames'][0]
-            keyboard_actions = sample['keyboard_actions']
-            mouse_actions = sample['mouse_actions']
-            vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_step_{curr_step}.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.latent_frames)
+            vid, icons_vid = generate_training_video(raw_model, vae, dataloader.dataset, device,
+                                                      output_path=f"{output_dir}/output_step_{curr_step}.mp4",
+                                                      overfit_blocks=args.overfit_blocks)
 
             # Switch back to train mode
             raw_model.train()
@@ -1308,11 +1495,9 @@ def main():
         raw_model.eval()
 
         # Generate a video using same initial frame and actions from training data
-        sample = dataloader.dataset[0]
-        initial_frame = sample['video_frames'][0]
-        keyboard_actions = sample['keyboard_actions']
-        mouse_actions = sample['mouse_actions']
-        vid, icons_video = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_epoch{epoch}.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.latent_frames)
+        vid, icons_video = generate_training_video(raw_model, vae, dataloader.dataset, device,
+                                                    output_path=f"{output_dir}/output_epoch{epoch}.mp4",
+                                                    overfit_blocks=args.overfit_blocks)
 
         # Switch back to train mode
         raw_model.train()
@@ -1353,11 +1538,9 @@ def main():
 
       print("Training loop complete.")
       raw_model = model.module if world_size > 1 else model
-      sample = dataloader.dataset[0]
-      initial_frame = sample['video_frames'][0]
-      keyboard_actions = sample['keyboard_actions']
-      mouse_actions = sample['mouse_actions']
-      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.latent_frames)
+      generate_training_video(raw_model, vae, dataloader.dataset, device,
+                              output_path=f"{output_dir}/final_output.mp4",
+                              overfit_blocks=args.overfit_blocks)
 
   # ==========================================================================
   # DDP CLEANUP - Clean up distributed processes
