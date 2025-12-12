@@ -712,7 +712,7 @@ def get_sequence_config(latent_frames, gpu="rtx6000", gradient_checkpointing=Fal
             "rtx6000": {  # 96GB
                 3:  {"batch_size": 4, "grad_accum": 3},   # ~35GB, video=9 frames
                 6:  {"batch_size": 3, "grad_accum": 4},   # ~55GB, video=21 frames
-                9:  {"batch_size": 2, "grad_accum": 6},   # ~75GB, video=33 frames
+                9:  {"batch_size": 1, "grad_accum": 12},   # ~75GB, video=33 frames
                 12: {"batch_size": 1, "grad_accum": 12},  # ~92GB, video=45 frames (tight fit)
             },
         }
@@ -739,7 +739,7 @@ def train_step(model, vae, batch, scheduler, accumulation_steps, device ):
         latents = vae.encode(frames, device=device).to(dtype=torch.bfloat16)
         first_frame = frames[:, :, :1, :, :]  # [B, C, 1, H, W]
         visual_context = vae.clip.encode_video(first_frame).to(device=device, dtype=torch.bfloat16)
-        raw_model.model.num_frame_per_block = 3 # its always 3 latents.shape[2]
+        raw_model.model.num_frame_per_block = latents.shape[2]
 
     # Free frames early - no longer needed after encoding
     del frames
@@ -803,6 +803,8 @@ def train_step(model, vae, batch, scheduler, accumulation_steps, device ):
 
         # Apply timestep-based loss weighting (uses the weights computed in scheduler.set_timesteps)
         weights = scheduler.training_weight(t_scaled.expand(batch_size))
+        # Add epsilon to avoid zero weights (timestep index 0 has weight=0 in the Gaussian weighting)
+        weights = weights + 0.05
         # weights shape: [batch_size], need to broadcast to [B, C, T, H, W]
         flow_loss = (weights.view(-1, 1, 1, 1, 1) * (flow_pred - target) ** 2).mean()
 
@@ -850,7 +852,7 @@ def test_logic(dataloader, model, vae, scheduler, device):
 
     # Encode
     latents = vae.encode(frames, device=device)
-    model.model.num_frame_per_block = 3 # its always 3.  latents.shape[2]
+    model.model.num_frame_per_block = latents.shape[2]
 
     print(f"Input frames shape: {frames.shape}")
     print(f"Latents shape: {latents.shape}") 
