@@ -57,34 +57,38 @@ def parse_args():
                         default="/media/kristofe/eight/data",
                         #default="/mnt/s3/uedata",
                         help="Path to training data directory")
-    parser.add_argument("--max_sequences", type=int, default=400,
+    parser.add_argument("--max_sequences", type=int, default=-1,
                         help="Max sequences to use from dataset (-1 for all)")
 
     # Training hyperparameters
-    parser.add_argument("--num_epochs", type=int, default=5,
+    parser.add_argument("--num_epochs", type=int, default=50,
                         help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=100,
+    parser.add_argument("--warmup_steps", type=int, default=1,
                         help="Number of warmup steps for LR scheduler")
 
     # LoRA settings
-    parser.add_argument("--lora_rank", type=int, default=64,
+    parser.add_argument("--lora_rank", type=int, default=128,
                         help="Rank of LoRA matrices")
-    parser.add_argument("--lora_alpha", type=int, default=128,
+    parser.add_argument("--lora_alpha", type=int, default=512,
                         help="Scaling factor for LoRA")
     parser.add_argument("--lora_dropout", type=float, default=0.0,
                         help="Dropout for LoRA layers")
     parser.add_argument("--lora_checkpoint", type=str, default="",
                         help="Path to LoRA weights for resuming training")
+    parser.add_argument("--lora_targets", type=str, default="all",
+                        help="Which layers to inject LoRA into: 'all', 'cross_attn', 'self_attn', 'ffn', or comma-separated combo (e.g., 'cross_attn,ffn')")
 
     # Sequence/memory settings
-    parser.add_argument("--latent_frames", type=int, default=17,
+    parser.add_argument("--latent_frames", type=int, default=3,
                         help="Number of latent frames (video_frames = 1 + 4*(latent_frames-1))")
     parser.add_argument("--gpu", type=str, default="rtx6000", choices=["a100", "rtx6000"],
                         help="GPU type for memory config")
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing (saves ~30-50%% memory, ~20-30%% slower)")
+    parser.add_argument("--output_latent_frames", type=int, default=3,
+                        help="Number of latent frames (video_frames = 1 + 4*(latent_frames-1))")
 
     # Batch size overrides (optional - auto-configured if not specified)
     parser.add_argument("--batch_size", type=int, default=None,
@@ -148,12 +152,12 @@ class LoRALayer(nn.Module):
         lora_out = self.dropout(x) @ self.lora_A.t() @ self.lora_B.t() * self.scaling
         return original_out + lora_out
     
-def inject_lora_layers(model, rank: int = 64, alpha: int = 128, dropout: float = 0.0):
+def inject_lora_layers(model, rank: int = 64, alpha: int = 128, dropout: float = 0.0, targets: str = "all"):
     """
     Inject LoRA layers into the model's linear layers.
 
     Returns:
-        lora_layers: List of LoRA parameters for optimization.
+        lora_params: List of LoRA parameters for optimization.
         num_lora_params: Total number of LoRA parameters added.
         lora_layers: list of LoRALayer instances added to the model.
     Args:
@@ -161,33 +165,50 @@ def inject_lora_layers(model, rank: int = 64, alpha: int = 128, dropout: float =
         rank: Rank of LoRA matrices
         alpha: Scaling factor
         dropout: Dropout probability for LoRA layers
+        targets: Which layers to inject - 'all', 'cross_attn', 'self_attn', 'ffn', or comma-separated combo
     """
     lora_layers = []
+
+    # Parse targets
+    if targets == "all":
+        inject_self_attn = True
+        inject_cross_attn = True
+        inject_ffn = True
+    else:
+        target_list = [t.strip() for t in targets.split(",")]
+        inject_self_attn = "self_attn" in target_list
+        inject_cross_attn = "cross_attn" in target_list
+        inject_ffn = "ffn" in target_list
+
+    print(f"LoRA targets: self_attn={inject_self_attn}, cross_attn={inject_cross_attn}, ffn={inject_ffn}")
 
     # Get the inner WanModel
     wan_model = model.model if hasattr(model, 'model') else model
 
     for block_idx, block in enumerate(wan_model.blocks):
         # Self-attention Q, K, V, O
-        for layer_name in ['q', 'k', 'v', 'o']:
-            original = getattr(block.self_attn, layer_name)
-            lora_layer = LoRALayer(original, rank=rank, alpha=alpha, dropout=dropout)
-            setattr(block.self_attn, layer_name, lora_layer)
-            lora_layers.append(lora_layer)
-        
+        if inject_self_attn:
+            for layer_name in ['q', 'k', 'v', 'o']:
+                original = getattr(block.self_attn, layer_name)
+                lora_layer = LoRALayer(original, rank=rank, alpha=alpha, dropout=dropout)
+                setattr(block.self_attn, layer_name, lora_layer)
+                lora_layers.append(lora_layer)
+
         # cross-attention Q, K, V, O
-        for layer_name in ['q', 'k', 'v', 'o']:
-            original = getattr(block.cross_attn, layer_name)
-            lora_layer = LoRALayer(original, rank=rank, alpha=alpha, dropout=dropout)
-            setattr(block.cross_attn, layer_name, lora_layer)
-            lora_layers.append(lora_layer)
-        
+        if inject_cross_attn:
+            for layer_name in ['q', 'k', 'v', 'o']:
+                original = getattr(block.cross_attn, layer_name)
+                lora_layer = LoRALayer(original, rank=rank, alpha=alpha, dropout=dropout)
+                setattr(block.cross_attn, layer_name, lora_layer)
+                lora_layers.append(lora_layer)
+
         # FFN layers (index 0 and 2 in the sequential)
-        for ffn_idx in [0, 2]:
-            original = block.ffn[ffn_idx]
-            lora_layer = LoRALayer(original, rank=rank, alpha=alpha, dropout=dropout)
-            block.ffn[ffn_idx] = lora_layer
-            lora_layers.append(lora_layer)
+        if inject_ffn:
+            for ffn_idx in [0, 2]:
+                original = block.ffn[ffn_idx]
+                lora_layer = LoRALayer(original, rank=rank, alpha=alpha, dropout=dropout)
+                block.ffn[ffn_idx] = lora_layer
+                lora_layers.append(lora_layer)
 
     # Collect LoRA parameters
     lora_params = []
@@ -637,8 +658,9 @@ def train_step(model, vae, batch, scheduler, accumulation_steps, device ):
 
     loss.backward()
 
-    #clip gradients
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    # Clip gradients only on LoRA parameters (the only ones with gradients)
+    lora_params_for_clip = [p for p in model.parameters() if p.requires_grad]
+    torch.nn.utils.clip_grad_norm_(lora_params_for_clip, max_norm=1.0)
 
     return loss.item(), flow_loss.item(),pred_x0 
 
@@ -760,7 +782,7 @@ def overfit_test(model, vae, dataloader, scheduler, device):
         print("FAIL: Loss did not decrease enough - check training loop")
     return loss
 
-def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, device):
+def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, device, num_output_frames=21):
     '''
     Generate a 3-second video (90 frames = 23 latent frames) given an initial frame and actions.
 
@@ -825,12 +847,14 @@ def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, d
 
     with torch.no_grad():
         tiler_kwargs = {"tiled": True, "tile_size": [44, 80], "tile_stride": [23, 38]}
+        # VAE is in float16, so input must be float16 for encoding
         img_cond = vae.encode(img_cond_input.to(torch.float16), device=device, **tiler_kwargs).to(device)
 
     # Build conditioning like inference.py
     mask_cond = torch.ones_like(img_cond)
     mask_cond[:, :, 1:] = 0
     cond_concat = torch.cat([mask_cond[:, :4], img_cond], dim=1)
+    # CLIP encoder also expects float16
     visual_context = vae.clip.encode_video(image.to(torch.float16))
 
     # Prepare noise and actions
@@ -864,27 +888,40 @@ def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, d
 
     return video
 
-def generate_video_file(model, vae, initial_frame, device, path="output.mp4"):
+def generate_video_file(model, vae, initial_frame, device, path="output.mp4", keyboard_actions=None, mouse_actions=None, num_output_frames=21):
     from PIL import Image
     import numpy as np
 
-    if initial_frame is None:
-        initial_frame = Image.open("demo_images/gta/0000.png")
+    num_action_steps = 1 + 4 * (num_output_frames - 1)  # 81 when num_output_frames=21
 
-    # Create constant actions (driving forward)
-    num_action_steps = 89
-    keyboard = torch.zeros(num_action_steps, 2)
-    keyboard[:, 0] = 1  # forward
+    # Use provided actions or create defaults
+    if keyboard_actions is not None:
+        keyboard = keyboard_actions[:num_action_steps]
+        # Pad if needed
+        if len(keyboard) < num_action_steps:
+            padding = torch.zeros(num_action_steps - len(keyboard), keyboard.shape[-1])
+            keyboard = torch.cat([keyboard, padding], dim=0)
+    else:
+        # Default: driving forward
+        keyboard = torch.zeros(num_action_steps, 2)
+        keyboard[:, 0] = 1  # forward
 
-    # steer in a sloted sine wave
-    steer_amplitude = 0.05
-    steer_frequency = 2 * torch.pi / num_action_steps * 2  # 2 full waves over the video
-    steer_values = steer_amplitude * torch.sin(torch.linspace(0, steer_frequency * num_action_steps, num_action_steps))
-    mouse = torch.zeros(num_action_steps, 2)
-    mouse[:, 1] = steer_values  # horizontal steering
+    if mouse_actions is not None:
+        mouse = mouse_actions[:num_action_steps]
+        # Pad if needed
+        if len(mouse) < num_action_steps:
+            padding = torch.zeros(num_action_steps - len(mouse), mouse.shape[-1])
+            mouse = torch.cat([mouse, padding], dim=0)
+    else:
+        # Default: sine wave steering
+        steer_amplitude = 0.05
+        steer_frequency = 2 * torch.pi / num_action_steps * 2
+        steer_values = steer_amplitude * torch.sin(torch.linspace(0, steer_frequency * num_action_steps, num_action_steps))
+        mouse = torch.zeros(num_action_steps, 2)
+        mouse[:, 1] = steer_values
 
     # Generate
-    video = generate_video(model, vae, initial_frame, keyboard, mouse, device)
+    video = generate_video(model, vae, initial_frame, keyboard, mouse, device, num_output_frames=num_output_frames)
 
     # Save
     import torchvision.io
@@ -1051,7 +1088,8 @@ def main():
         model,
         rank=args.lora_rank,
         alpha=args.lora_alpha,
-        dropout=args.lora_dropout
+        dropout=args.lora_dropout,
+        targets=args.lora_targets
   )
   if args.lora_checkpoint:
       load_lora_state_dict(model, args.lora_checkpoint)
@@ -1093,7 +1131,7 @@ def main():
 
   pprint("\n=== Starting training loop ===")
   model.train()
-  optimizer = torch.optim.AdamW(lora_params, lr=args.lr)
+  optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=0.01)
 
   # Learning rate scheduler with warmup
   total_steps = args.num_epochs * len(dataloader)
@@ -1105,8 +1143,11 @@ def main():
   if is_main:
       # For DDP, access underlying model with model.module
       raw_model = model.module if world_size > 1 else model
-      initial_frame = dataloader.dataset[0]['video_frames'][0]
-      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4")
+      sample = dataloader.dataset[0]
+      initial_frame = sample['video_frames'][0]
+      keyboard_actions = sample['keyboard_actions']
+      mouse_actions = sample['mouse_actions']
+      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.output_latent_frames)
 
   # initialize tqdm progress bar
   reduced_steps = -1
@@ -1124,6 +1165,7 @@ def main():
     "lora_rank": args.lora_rank,
     "lora_alpha": args.lora_alpha,
     "lora_dropout": args.lora_dropout,
+    "lora_targets": args.lora_targets,
     "world_size": world_size,
   }
 
@@ -1167,6 +1209,12 @@ def main():
                 writer.add_scalar("StdDev Batch", pred_x0.std().item(), curr_step)
                 writer.add_scalar("LR", optimizer.param_groups[0]['lr'], curr_step)
 
+                # Monitor LoRA weight norms to detect collapse
+                lora_A_norm = sum(layer.lora_A.norm().item() for layer in lora_layers) / len(lora_layers)
+                lora_B_norm = sum(layer.lora_B.norm().item() for layer in lora_layers) / len(lora_layers)
+                writer.add_scalar("LoRA/avg_A_norm", lora_A_norm, curr_step)
+                writer.add_scalar("LoRA/avg_B_norm", lora_B_norm, curr_step)
+
         if is_main:
                 pbar.set_description(f"Ep {epoch}-{step}, flow_loss: {flow_loss:.6f}")
                 
@@ -1176,9 +1224,18 @@ def main():
             # For DDP, access underlying model with model.module
             raw_model = model.module if world_size > 1 else model
 
-            # Generate a video at the end of each epoch
-            initial_frame = dataloader.dataset[np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]
-            vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_s{curr_step}.mp4")
+            # Switch to eval mode for generation
+            raw_model.eval()
+
+            # Generate a video using same initial frame and actions from training data
+            sample = dataloader.dataset[0]
+            initial_frame = sample['video_frames'][0]
+            keyboard_actions = sample['keyboard_actions']
+            mouse_actions = sample['mouse_actions']
+            vid, icons_vid =      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.output_latent_frames)
+
+            # Switch back to train mode
+            raw_model.train()
 
             # Extract first middle and last frames for tensorboard
             mid_frame = vid[vid.shape[0] // 2]
@@ -1194,9 +1251,18 @@ def main():
         # For DDP, access underlying model with model.module
         raw_model = model.module if world_size > 1 else model
 
-        # Generate a video at the end of each epoch
-        initial_frame = dataloader.dataset[np.random.randint(0, len(dataloader.dataset))]['video_frames'][0]
-        vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_e{epoch}.mp4")
+        # Switch to eval mode for generation
+        raw_model.eval()
+
+        # Generate a video using same initial frame and actions from training data
+        sample = dataloader.dataset[0]
+        initial_frame = sample['video_frames'][0]
+        keyboard_actions = sample['keyboard_actions']
+        mouse_actions = sample['mouse_actions']
+        vid, icons_v      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.output_latent_frames)
+
+        # Switch back to train mode
+        raw_model.train()
 
         # Extract first middle and last frames for tensorboard
         mid_frame = vid[vid.shape[0] // 2]
@@ -1234,8 +1300,11 @@ def main():
 
       print("Training loop complete.")
       raw_model = model.module if world_size > 1 else model
-      initial_frame = dataloader.dataset[0]['video_frames'][0]
-      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/final_output.mp4")
+      sample = dataloader.dataset[0]
+      initial_frame = sample['video_frames'][0]
+      keyboard_actions = sample['keyboard_actions']
+      mouse_actions = sample['mouse_actions']
+      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.output_latent_frames)
 
   # ==========================================================================
   # DDP CLEANUP - Clean up distributed processes
