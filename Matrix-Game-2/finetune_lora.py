@@ -78,16 +78,16 @@ def parse_args():
     # Training hyperparameters
     parser.add_argument("--num_epochs", type=int, default=50,
                         help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5,
+                        help="Learning rate (1e-5 recommended for LoRA, lower for overfitting)")
     parser.add_argument("--warmup_steps", type=int, default=1,
                         help="Number of warmup steps for LR scheduler")
 
     # LoRA settings
-    parser.add_argument("--lora_rank", type=int, default=128,
-                        help="Rank of LoRA matrices")
-    parser.add_argument("--lora_alpha", type=int, default=512,
-                        help="Scaling factor for LoRA")
+    parser.add_argument("--lora_rank", type=int, default=64,
+                        help="Rank of LoRA matrices (higher = more capacity, more memory)")
+    parser.add_argument("--lora_alpha", type=int, default=64,
+                        help="Scaling factor for LoRA (effective scale = alpha/rank, recommend alpha=rank)")
     parser.add_argument("--lora_dropout", type=float, default=0.0,
                         help="Dropout for LoRA layers")
     parser.add_argument("--lora_checkpoint", type=str, default="",
@@ -757,19 +757,26 @@ def train_step(model, vae, batch, scheduler, accumulation_steps, device ):
     cond_concat = torch.cat([mask_cond, latents], dim=1)
 
     #sample random timestep
-    # t_scalar is in [0.05, 0.95] representing sigma interpolation
-    # scheduler.timesteps are in [0, num_train_timesteps] range
-    # We need to scale t_scalar to match the timesteps range for add_noise
+    # CRITICAL: Sample from the SAME discrete timesteps used during inference
+    # Inference uses warped denoising_step_list: [1000, 666, 333]
+    # After warping: timesteps[1000 - denoising_step_list] -> indices [0, 334, 667]
+    # We sample from these specific timestep VALUES to match what the model sees at inference
     batch_size = latents.shape[0]
-    t_scalar = torch.rand(1, device=device) * 0.9 + 0.05  # [0.05, 0.95] avoid extremes
 
-    # Scale to timestep range for scheduler.add_noise (expects values matching self.timesteps)
-    # self.timesteps = self.sigmas * num_train_timesteps, so we scale accordingly
-    t_scaled = t_scalar * scheduler.num_train_timesteps  # [50, 950] for 1000 timesteps
+    # Get the actual timestep values at these indices
+    # scheduler.timesteps has 1000 values after set_timesteps(1000)
+    inference_timestep_indices = [0, 334, 667]  # Indices matching inference
+    scheduler.timesteps = scheduler.timesteps.to(device)
+    inference_timesteps = scheduler.timesteps[inference_timestep_indices]  # Get actual values
+
+    # Randomly select one of the 3 inference timesteps
+    idx = torch.randint(0, len(inference_timesteps), (1,), device=device)
+    t_scaled = inference_timesteps[idx]  # Single timestep value
 
     # For model forward pass, use scaled timestep
+    # CRITICAL: Use int64 to match inference (causal_inference.py uses torch.int64)
     t = t_scaled.expand(batch_size)
-    timestep = t.unsqueeze(1).expand(batch_size, num_latent_frames).to(dtype=torch.bfloat16)
+    timestep = t.unsqueeze(1).expand(batch_size, num_latent_frames).to(dtype=torch.int64)
 
     #add noise using scaled timestep
     noise = torch.randn_like(latents)
@@ -792,8 +799,12 @@ def train_step(model, vae, batch, scheduler, accumulation_steps, device ):
         )   
 
         # flow matching loss: predict velocity (latents - noise)
-        target = scheduler.training_target(latents, noise, t_scalar)
-        flow_loss = torch.nn.functional.mse_loss(flow_pred, target)
+        target = scheduler.training_target(latents, noise, t_scaled)
+
+        # Apply timestep-based loss weighting (uses the weights computed in scheduler.set_timesteps)
+        weights = scheduler.training_weight(t_scaled.expand(batch_size))
+        # weights shape: [batch_size], need to broadcast to [B, C, T, H, W]
+        flow_loss = (weights.view(-1, 1, 1, 1, 1) * (flow_pred - target) ** 2).mean()
 
     loss = flow_loss
     loss = loss / accumulation_steps  # normalize for gradient accumulation
