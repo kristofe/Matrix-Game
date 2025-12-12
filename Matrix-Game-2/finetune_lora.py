@@ -81,14 +81,12 @@ def parse_args():
                         help="Which layers to inject LoRA into: 'all', 'cross_attn', 'self_attn', 'ffn', or comma-separated combo (e.g., 'cross_attn,ffn')")
 
     # Sequence/memory settings
-    parser.add_argument("--latent_frames", type=int, default=3,
+    parser.add_argument("--latent_frames", type=int, default=18,
                         help="Number of latent frames (video_frames = 1 + 4*(latent_frames-1))")
     parser.add_argument("--gpu", type=str, default="rtx6000", choices=["a100", "rtx6000"],
                         help="GPU type for memory config")
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing (saves ~30-50%% memory, ~20-30%% slower)")
-    parser.add_argument("--output_latent_frames", type=int, default=3,
-                        help="Number of latent frames (video_frames = 1 + 4*(latent_frames-1))")
 
     # Batch size overrides (optional - auto-configured if not specified)
     parser.add_argument("--batch_size", type=int, default=None,
@@ -438,12 +436,12 @@ class SimpleDataset(Dataset):
           mouse: [vertical, horizontal]
       """
       keyboard = [
-        1.0 if throttle > 0.1 else 0.0,  # forward binary
-        1.0 if brake > 0.1 else 0.0      # back binary
+        throttle,  # forward - use actual throttle value (0-1) instead of binary
+        brake      # back - use actual brake value (0-1) instead of binary
       ]
       mouse = [
           0.0,      # vertical (not used for driving)
-          steering * 0.1 # horizontal (steering = camera rotation)
+          steering * 0.05 # horizontal (steering = camera rotation), reduced from 0.1
       ]
       return keyboard, mouse
 
@@ -478,6 +476,57 @@ class SimpleDataset(Dataset):
           'keyboard_actions': torch.tensor(keyboard_actions, dtype=torch.float32),  # [T, 2] = [9, 2] (forward, back)
           'mouse_actions': torch.tensor(mouse_actions, dtype=torch.float32),        # [T, 2] = [9, 2] (vertical, horizontal/steering)
       }
+
+def visualize_sequence_grid(sample, output_path="sequence_grid.png", thumb_size=64):
+    """
+    Create a grid visualization of frames from a dataset sequence.
+
+    Args:
+        sample: Dict with 'video_frames' tensor of shape [T, H, W, C] in range [-1, 1]
+        output_path: Path to save the grid image
+        thumb_size: Size of each thumbnail (will be thumb_size x thumb_size * aspect_ratio)
+
+    Returns:
+        PIL Image of the grid
+    """
+    from PIL import Image
+    import math
+
+    frames = sample['video_frames']  # [T, H, W, C] in [-1, 1]
+    T, H, W, C = frames.shape
+
+    # Convert from [-1, 1] to [0, 255]
+    frames_uint8 = ((frames + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()
+
+    # Calculate thumbnail dimensions preserving aspect ratio
+    aspect = W / H
+    thumb_h = thumb_size
+    thumb_w = int(thumb_size * aspect)
+
+    # Calculate grid dimensions (roughly square)
+    cols = math.ceil(math.sqrt(T * aspect))
+    rows = math.ceil(T / cols)
+
+    # Create output image
+    grid_w = cols * thumb_w
+    grid_h = rows * thumb_h
+    grid_img = Image.new('RGB', (grid_w, grid_h), (0, 0, 0))
+
+    for i in range(T):
+        row = i // cols
+        col = i % cols
+
+        # Convert frame to PIL and resize
+        frame_pil = Image.fromarray(frames_uint8[i])
+        frame_thumb = frame_pil.resize((thumb_w, thumb_h), Image.LANCZOS)
+
+        # Paste into grid
+        grid_img.paste(frame_thumb, (col * thumb_w, row * thumb_h))
+
+    grid_img.save(output_path)
+    print(f"Saved sequence grid ({T} frames, {cols}x{rows}) to {output_path}")
+    return grid_img
+
 
 def verify_batch(batch):
     frames = batch['video_frames']
@@ -800,7 +849,6 @@ def generate_video(model, vae, initial_frame, keyboard_actions, mouse_actions, d
     from pipeline import CausalInferencePipeline
     from demo_utils.vae_block3 import VAEDecoderWrapper
 
-    num_output_frames = 21  # latent frames = 81 video frames (~3.2s at 25fps)
     num_action_steps = 1 + 4 * (num_output_frames - 1)  # 81
 
     #process initial frame if needed
@@ -1072,6 +1120,11 @@ def main():
       # Single GPU - use regular shuffle
       dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+  if is_main:
+    # Get a sample from the dataset
+    sample = dataset[0]
+    visualize_sequence_grid(sample, "my_sequence_small.png", thumb_size=128)
+
   pprint("\nLoading model...")
   model, vae = load_model(device, gradient_checkpointing=args.gradient_checkpointing)
   pprint("Model loaded.")
@@ -1147,7 +1200,7 @@ def main():
       initial_frame = sample['video_frames'][0]
       keyboard_actions = sample['keyboard_actions']
       mouse_actions = sample['mouse_actions']
-      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.output_latent_frames)
+      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.latent_frames)
 
   # initialize tqdm progress bar
   reduced_steps = -1
@@ -1232,7 +1285,7 @@ def main():
             initial_frame = sample['video_frames'][0]
             keyboard_actions = sample['keyboard_actions']
             mouse_actions = sample['mouse_actions']
-            vid, icons_vid =      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.output_latent_frames)
+            vid, icons_vid = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_step_{curr_step}.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.latent_frames)
 
             # Switch back to train mode
             raw_model.train()
@@ -1259,7 +1312,7 @@ def main():
         initial_frame = sample['video_frames'][0]
         keyboard_actions = sample['keyboard_actions']
         mouse_actions = sample['mouse_actions']
-        vid, icons_v      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.output_latent_frames)
+        vid, icons_video = generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/output_epoch{epoch}.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.latent_frames)
 
         # Switch back to train mode
         raw_model.train()
@@ -1304,7 +1357,7 @@ def main():
       initial_frame = sample['video_frames'][0]
       keyboard_actions = sample['keyboard_actions']
       mouse_actions = sample['mouse_actions']
-      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.output_latent_frames)
+      generate_video_file(raw_model, vae, initial_frame, device, path=f"{output_dir}/initial_output.mp4", keyboard_actions=keyboard_actions, mouse_actions=mouse_actions, num_output_frames=args.latent_frames)
 
   # ==========================================================================
   # DDP CLEANUP - Clean up distributed processes
