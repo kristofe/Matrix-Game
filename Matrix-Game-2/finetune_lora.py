@@ -1309,7 +1309,13 @@ def main():
       # Single GPU - use regular shuffle
       dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+  # creating output folder (only on main process)
+  from zoneinfo import ZoneInfo
+  timestamp = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d-%H_%M_%S")
+  output_dir = args.output_dir if args.output_dir else f"outputs/finetune_lora_{timestamp}"
+  pprint(f"Outputs will be saved to: {output_dir}")
   if is_main:
+    os.makedirs(output_dir, exist_ok=True)
     # Visualize training sequence (handles both regular and overfit_blocks modes)
     visualize_training_sequence(dataset, f"{output_dir}/training_sequence.png",
                                  thumb_size=128, overfit_blocks=args.overfit_blocks)
@@ -1358,13 +1364,6 @@ def main():
   # Set timesteps for training (1000 steps for full resolution)
   scheduler.set_timesteps(1000, training=True)
 
-  # creating output folder (only on main process)
-  from zoneinfo import ZoneInfo
-  timestamp = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d-%H_%M_%S")
-  output_dir = args.output_dir if args.output_dir else f"outputs/finetune_lora_{timestamp}"
-  if is_main:
-      os.makedirs(output_dir, exist_ok=True)
-  pprint(f"Outputs will be saved to: {output_dir}")
 
   # Synchronize all processes before continuing
   # This ensures the output directory is created before other processes try to use it
