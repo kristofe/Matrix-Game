@@ -78,7 +78,7 @@ def parse_args():
                         help="Number of warmup steps for LR scheduler")
 
     # Layer selection for training
-    parser.add_argument("--train_targets", type=str, default="style",
+    parser.add_argument("--train_targets", type=str, default="all",
                         help="Which layers to train: 'all', 'later_blocks', 'style', 'self_attn', 'cross_attn', 'ffn', or comma-separated combo (e.g., 'self_attn,ffn')")
     parser.add_argument("--freeze_first_n_blocks", type=int, default=15,
                         help="When using --train_targets=later_blocks, freeze the first N transformer blocks (default: 15)")
@@ -509,7 +509,7 @@ def get_sequence_config(latent_frames, gpu="rtx6000", gradient_checkpointing=Fal
                 3:  {"batch_size": 1, "grad_accum": 12},  # ~35GB, video=9 frames
             },
             "rtx6000": {  # 96GB
-                3:  {"batch_size": 2, "grad_accum": 6},   # ~45GB, video=9 frames
+                3:  {"batch_size": 3, "grad_accum": 6},   # ~45GB, video=9 frames
                 6:  {"batch_size": 1, "grad_accum": 12},  # ~65GB, video=21 frames
                 9:  {"batch_size": 1, "grad_accum": 12},  # ~85GB, video=33 frames
             },
@@ -945,10 +945,10 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4", ke
     # Use provided actions or create defaults
     if keyboard_actions is not None:
         keyboard = keyboard_actions[:num_action_steps]
-        # Pad if needed
+        # Pad by repeating existing data if needed
         if len(keyboard) < num_action_steps:
-            padding = torch.zeros(num_action_steps - len(keyboard), keyboard.shape[-1])
-            keyboard = torch.cat([keyboard, padding], dim=0)
+            num_repeats = (num_action_steps // len(keyboard)) + 1
+            keyboard = keyboard.repeat(num_repeats, 1)[:num_action_steps]
     else:
         # Default: driving forward
         keyboard = torch.zeros(num_action_steps, 2)
@@ -956,10 +956,10 @@ def generate_video_file(model, vae, initial_frame, device, path="output.mp4", ke
 
     if mouse_actions is not None:
         mouse = mouse_actions[:num_action_steps]
-        # Pad if needed
+        # Pad by repeating existing data if needed
         if len(mouse) < num_action_steps:
-            padding = torch.zeros(num_action_steps - len(mouse), mouse.shape[-1])
-            mouse = torch.cat([mouse, padding], dim=0)
+            num_repeats = (num_action_steps // len(mouse)) + 1
+            mouse = mouse.repeat(num_repeats, 1)[:num_action_steps]
     else:
         # Default: sine wave steering
         steer_amplitude = 0.05
