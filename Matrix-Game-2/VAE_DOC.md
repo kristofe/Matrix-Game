@@ -14,6 +14,11 @@ A comprehensive guide to the 3D Video VAE used in Matrix-Game-2, written for ML 
 7. [Simplified Implementation](#7-simplified-implementation)
 8. [File Reference](#8-file-reference)
 
+**Appendices**
+- [Appendix A: VAE in the Full Pipeline](#appendix-a-vae-in-the-full-pipeline)
+- [Appendix B: CLIP Integration](#appendix-b-clip-integration)
+- [Appendix C: Streaming Decoder](#appendix-c-streaming-decoder)
+
 ---
 
 ## 1. Overview
@@ -856,3 +861,356 @@ NORMALIZATION (per-channel):
   Encode: z = (mu - mean) / std
   Decode: z = z * std + mean
 ```
+
+---
+
+## Appendix A: VAE in the Full Pipeline
+
+### A.1 Overview: Where VAE Fits
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        INFERENCE PIPELINE                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Input Image │ ──▶ │ VAE Encoder  │ ──▶ │   Diffusion  │ ──▶ │ VAE Decoder  │ ──▶ Output Video
+│  [3,1,H,W]   │     │              │     │    Model     │     │  (Streaming) │     [3,T,H,W]
+└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+                            │                    ▲
+                            │                    │
+                            ▼                    │
+                     ┌──────────────┐     ┌──────────────┐
+                     │    CLIP      │     │  Keyboard/   │
+                     │  (Visual     │     │   Mouse      │
+                     │   Context)   │     │   Actions    │
+                     └──────────────┘     └──────────────┘
+```
+
+**From `inference.py`:**
+
+```python
+# Step 1: Load VAE + CLIP together
+vae = get_wanx_vae_wrapper(self.args.pretrained_model_path, torch.float16)
+# This loads BOTH:
+#   - vae.vae: the VideoVAE model
+#   - vae.clip: the CLIPModel for visual conditioning
+
+# Step 2: Encode input image to latent space
+img_cond = self.vae.encode(img_cond, device=self.device, **tiler_kwargs)
+# Input:  [1, 3, 597, 352, 640]
+# Output: [1, 16, 150, 44, 80]
+
+# Step 3: Get visual context from CLIP (for conditioning diffusion)
+visual_context = self.vae.clip.encode_video(image)
+# Output: [B, 257, 1280] - CLIP features for cross-attention
+
+# Step 4: Diffusion generates latents (block by block)
+# Step 5: VAE Decoder (streaming) converts latents back to video
+```
+
+### A.2 Pipeline Flow in Detail
+
+**From `pipeline/causal_inference.py`:**
+
+```python
+class CausalInferencePipeline:
+    def inference(self, noise, conditional_dict, ...):
+        # Initialize streaming VAE cache
+        vae_cache = copy.deepcopy(ZERO_VAE_CACHE)  # 32 cache tensors
+        videos = []
+
+        # For each block of latent frames...
+        for current_num_frames in all_num_frames:
+            # 1. Denoise the latent (diffusion model)
+            for timestep in denoising_steps:
+                denoised_pred = self.generator(
+                    noisy_input,
+                    conditional_dict,  # Contains visual_context from CLIP
+                    timestep,
+                    kv_cache=...,
+                )
+
+            # 2. IMMEDIATELY decode to video (streaming)
+            video, vae_cache = self.vae_decoder(denoised_pred, *vae_cache)
+            videos.append(video)  # Accumulate decoded frames
+
+        return videos  # List of video chunks
+```
+
+**Key insight**: The VAE decoder is called **after every diffusion block**, not at the end. This enables:
+- **Low latency**: See frames as they're generated
+- **Memory efficiency**: Don't store all latents before decoding
+- **Streaming output**: Can display/save frames incrementally
+
+---
+
+## Appendix B: CLIP Integration
+
+### B.1 Is CLIP Used in VAE Training?
+
+**No.** CLIP and VAE are completely independent:
+
+1. **VAE is trained separately** - standard reconstruction + KL loss
+2. **CLIP is a pretrained model** - loaded from `open-clip-xlm-roberta-large-vit-huge-14.pth`
+3. **They're only combined at inference time** for the diffusion model
+
+**Evidence from `finetune_base.py`:**
+
+```python
+# Load VAE + CLIP
+vae = get_wanx_vae_wrapper("models/", torch.float16)
+vae.requires_grad_(False)  # VAE is FROZEN
+vae.eval()
+
+# During training:
+def train_step(model, vae, batch, ...):
+    # VAE encodes training data to latents
+    latents = vae.encode(frames, device=device)
+
+    # CLIP provides visual context (separate from VAE)
+    visual_context = vae.clip.encode_video(first_frame)
+
+    # Only the DIFFUSION MODEL is trained
+    loss = diffusion_model(latents, visual_context, ...)
+```
+
+### B.2 How CLIP is Used
+
+**File:** `wan/vae/wanx_vae_src/clip.py`
+
+CLIP provides a 1280-dimensional visual embedding for conditioning:
+
+```python
+class CLIPModel:
+    def encode_video(self, video):
+        # video: [B, 3, T, H, W]
+        b, c, t, h, w = video.shape
+
+        # Reshape to process each frame
+        video = video.transpose(1, 2).reshape(b * t, c, h, w)
+
+        # Resize to CLIP's expected size (224x224)
+        video = F.interpolate(video, size=(224, 224), mode='bicubic')
+
+        # Normalize for CLIP
+        video = self.transforms(video)  # CLIP normalization
+
+        # Run through ViT (stopping before final pooling)
+        out = self.model.visual(video, use_31_block=True)
+        # Output: [B*T, 257, 1280]
+        # 257 = 1 CLS token + 256 patch tokens (16x16 grid)
+
+        return out
+```
+
+**The output is used for cross-attention in the diffusion model's transformer blocks.**
+
+### B.3 VAE + CLIP Wrapper
+
+**File:** `wan/vae/wanx_vae.py`
+
+```python
+class WanxVAEWrapper:
+    def __init__(self, vae, clip):
+        self.vae = vae   # VideoVAE for encode/decode
+        self.clip = clip  # CLIPModel for visual conditioning
+
+    def encode(self, x, device, tiled=False, ...):
+        return self.vae.encode(x, device=device, tiled=tiled, ...)
+
+    def decode(self, latents, device, tiled=False, ...):
+        return self.vae.decode(latents, device=device, tiled=tiled, ...)
+
+def get_wanx_vae_wrapper(model_path, weight_dtype):
+    vae = WanVAE(pretrained_path=os.path.join(model_path, "Wan2.1_VAE.pth"))
+    clip = CLIPModel(
+        checkpoint_path=os.path.join(model_path, "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+        tokenizer_path=os.path.join(model_path, 'xlm-roberta-large')
+    )
+    return WanxVAEWrapper(vae, clip)
+```
+
+---
+
+## Appendix C: Streaming Decoder
+
+### C.1 Why Streaming?
+
+Normal VAE decoding:
+```python
+# Wait for ALL latents, then decode
+all_latents = diffusion_model.generate()  # [B, 16, 150, 44, 80]
+video = vae.decode(all_latents)           # Decode all at once
+```
+
+Streaming VAE decoding:
+```python
+# Decode each block immediately after it's generated
+for block in diffusion_blocks:
+    latent_block = diffusion_model.denoise(block)  # [B, 16, 3, 44, 80]
+    video_block, cache = vae_decoder(latent_block, cache)
+    yield video_block  # Output frames immediately!
+```
+
+### C.2 The VAE Cache Structure
+
+**File:** `demo_utils/constant.py`
+
+The streaming decoder maintains 32 cache tensors, one for each CausalConv3d:
+
+```python
+ZERO_VAE_CACHE = [
+    # Layer 0: conv2 (latent input)
+    torch.zeros(1, 16, 2, 44, 80),      # 44x80 (latent resolution)
+
+    # Layers 1-11: Middle block + first upsample level (384 channels)
+    torch.zeros(1, 384, 2, 44, 80),     # 11 tensors at 44x80
+
+    # Layers 12-18: After first upsample (384→192 channels, 2x resolution)
+    torch.zeros(1, 192, 2, 88, 160),    # 7 tensors at 88x160
+    torch.zeros(1, 384, 2, 88, 160),
+
+    # Layers 19-25: After second upsample (192→96 channels, 4x resolution)
+    torch.zeros(1, 192, 2, 176, 320),   # 7 tensors at 176x320
+
+    # Layers 26-31: After third upsample (96 channels, 8x resolution)
+    torch.zeros(1, 96, 2, 352, 640),    # 6 tensors at 352x640 (output resolution)
+]
+```
+
+**Each cache stores the last 2 frames** (CACHE_T = 2) of intermediate features.
+
+### C.3 VAEDecoderWrapper
+
+**File:** `demo_utils/vae_block3.py`
+
+```python
+class VAEDecoderWrapper(nn.Module):
+    def __init__(self):
+        self.decoder = VAEDecoder3d()
+        self.conv2 = CausalConv3d(16, 16, 1)
+
+        # Hardcoded normalization constants
+        self.mean = torch.tensor([...])  # 16 values
+        self.std = torch.tensor([...])   # 16 values
+        self.z_dim = 16
+
+    def forward(self, z, *feat_cache):
+        # z: [B, T, C, H, W] -> transpose to [B, C, T, H, W]
+        z = z.permute(0, 2, 1, 3, 4)
+        feat_cache = list(feat_cache)
+
+        # Denormalize
+        scale = [self.mean, 1.0 / self.std]
+        z = z / scale[1].view(1, 16, 1, 1, 1) + scale[0].view(1, 16, 1, 1, 1)
+
+        # Process through conv2
+        x = self.conv2(z)
+
+        # Decode each latent frame with caching
+        for i in range(z.shape[2]):
+            if i == 0:
+                out, feat_cache = self.decoder(x[:, :, i:i+1, :, :], feat_cache)
+            else:
+                out_, feat_cache = self.decoder(x[:, :, i:i+1, :, :], feat_cache)
+                out = torch.cat([out, out_], dim=2)
+
+        # Clamp and transpose back
+        out = out.float().clamp_(-1, 1)
+        out = out.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W]
+
+        return out, feat_cache  # Return BOTH video AND updated cache
+```
+
+### C.4 How Caching Works
+
+Each CausalConv3d layer:
+1. **Receives** the cache from the previous call (last 2 frames of features)
+2. **Concatenates** cache with current input
+3. **Computes** the convolution (now has enough temporal context)
+4. **Updates** the cache with the last 2 frames of current features
+5. **Returns** output and updated cache
+
+```python
+def forward(self, x, cache_x=None):
+    # cache_x: [B, C, 2, H, W] - last 2 frames from previous call
+
+    if cache_x is not None:
+        # Prepend cached frames to current input
+        x = torch.cat([cache_x, x], dim=2)  # [B, C, 2+T, H, W]
+        # Reduce the zero-padding since we have real data
+
+    # Apply causal padding (only on left side of time)
+    x = F.pad(x, self._padding)
+
+    # Convolution
+    return super().forward(x)
+```
+
+### C.5 Streaming Decode in the Pipeline
+
+```python
+# From CausalInferencePipeline.inference()
+
+# Initialize cache with zeros (or None)
+vae_cache = copy.deepcopy(ZERO_VAE_CACHE)
+for j in range(len(vae_cache)):
+    vae_cache[j] = None  # Will be populated on first call
+
+# For each block of latents...
+for block_idx in range(num_blocks):
+    # Diffusion generates 3 latent frames
+    denoised_pred = diffusion_step(...)  # [B, 16, 3, 44, 80]
+
+    # Immediately decode with cached state
+    video_chunk, vae_cache = self.vae_decoder(
+        denoised_pred.transpose(1, 2).half(),  # [B, 3, 16, 44, 80]
+        *vae_cache  # Unpack 32 cache tensors
+    )
+    # video_chunk: [B, ~12, 3, 352, 640]  (3 latent frames → ~12 video frames)
+
+    videos.append(video_chunk)
+
+    # vae_cache is now updated for next iteration!
+```
+
+### C.6 Diagram: Streaming Decode
+
+```
+Block 0                          Block 1                          Block 2
+────────                         ────────                         ────────
+
+Latents: [16, 3, 44, 80]        Latents: [16, 3, 44, 80]        Latents: [16, 3, 44, 80]
+         │                               │                               │
+         ▼                               ▼                               ▼
+┌─────────────────┐             ┌─────────────────┐             ┌─────────────────┐
+│  VAE Decoder    │             │  VAE Decoder    │             │  VAE Decoder    │
+│  + Empty Cache  │ ──cache──▶  │  + Cache[0]     │ ──cache──▶  │  + Cache[1]     │
+└─────────────────┘             └─────────────────┘             └─────────────────┘
+         │                               │                               │
+         ▼                               ▼                               ▼
+Video: [3, 9, 352, 640]         Video: [3, 12, 352, 640]        Video: [3, 12, 352, 640]
+(First frame + 2×4)             (3×4 frames)                    (3×4 frames)
+
+Total: 9 + 12 + 12 + ... frames (no seams, smooth transitions)
+```
+
+The cache ensures temporal coherence between blocks - without it, each block would have discontinuities at the boundaries.
+
+---
+
+## Summary
+
+| Component | Role | Training |
+|-----------|------|----------|
+| **VAE Encoder** | Compress video → latent | Trained separately (reconstruction + KL) |
+| **VAE Decoder** | Decompress latent → video | Trained with encoder |
+| **CLIP** | Visual conditioning for diffusion | Pretrained, frozen |
+| **Diffusion Model** | Generate latents from noise | Trained with VAE+CLIP frozen |
+
+**Key takeaways:**
+1. VAE and CLIP are independent - CLIP is NOT used in VAE training
+2. VAE decoder is called incrementally (streaming) for low latency
+3. The 32-tensor cache enables temporal coherence in streaming mode
+4. CLIP's 257×1280 features condition the diffusion model via cross-attention
