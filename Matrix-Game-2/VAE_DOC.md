@@ -373,8 +373,8 @@ Self-attention per frame (2D spatial attention):
 class AttentionBlock(nn.Module):
     def __init__(self, dim):
         self.norm = RMS_norm(dim)
-        self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
-        self.proj = nn.Conv2d(dim, dim, 1)
+        self.to_qkv = nn.Conv2d(dim, dim * 3, 1)  # 1x1 conv = linear projection
+        self.proj = nn.Conv2d(dim, dim, 1)        # 1x1 conv = linear projection
         nn.init.zeros_(self.proj.weight)  # Initialize to identity
 
     def forward(self, x):
@@ -382,17 +382,27 @@ class AttentionBlock(nn.Module):
         x = rearrange(x, 'b c t h w -> (b t) c h w')  # Flatten time into batch
         x = self.norm(x)
 
+        # Reshape for attention: each spatial position becomes a token
         q, k, v = self.to_qkv(x).reshape(b*t, 1, c*3, h*w).permute(0,1,3,2).chunk(3, dim=-1)
-        x = F.scaled_dot_product_attention(q, k, v)
+        # q, k, v shapes: [B*T, 1, H*W, C] - H*W tokens, each with C dimensions
+
+        x = F.scaled_dot_product_attention(q, k, v)  # Standard matrix attention!
 
         x = self.proj(x)
         x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
         return x + identity
 ```
 
+**Important clarification:**
+- The `nn.Conv2d(..., 1)` layers are **1x1 convolutions**, which are mathematically equivalent to `nn.Linear` applied independently at each spatial position. This is a common pattern in vision architectures.
+- The actual attention mechanism uses **standard scaled dot-product attention**: `softmax(QK^T / sqrt(d)) * V`
+- Each spatial position (pixel) becomes a "token", so attention is computed over H×W tokens per frame
+
 ### 4.5 Resample (Downsample/Upsample)
 
 **File:** `wan/modules/vae.py:66-161`
+
+Handles spatial (H, W) and temporal (T) resampling **separately**.
 
 ```python
 class Resample(nn.Module):
@@ -400,23 +410,215 @@ class Resample(nn.Module):
         # mode: 'downsample2d', 'downsample3d', 'upsample2d', 'upsample3d'
 
         if mode == 'downsample2d':
+            # Spatial only: H,W → H/2, W/2
+            self.resample = nn.Sequential(
+                nn.ZeroPad2d((0, 1, 0, 1)),  # Asymmetric pad for odd dims
+                nn.Conv2d(dim, dim, 3, stride=2)
+            )
+
+        elif mode == 'downsample3d':
+            # Spatial: same as downsample2d
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)),
                 nn.Conv2d(dim, dim, 3, stride=2)
             )
-        elif mode == 'downsample3d':
-            self.resample = nn.Sequential(...)  # Spatial
+            # Temporal: T → T/2 (kernel covers 3 frames, stride 2)
             self.time_conv = CausalConv3d(dim, dim, (3,1,1), stride=(2,1,1))
 
         elif mode == 'upsample2d':
+            # Spatial only: H,W → 2H, 2W
             self.resample = nn.Sequential(
                 nn.Upsample(scale_factor=2, mode='nearest'),
-                nn.Conv2d(dim, dim//2, 3, padding=1)  # Halves channels!
+                nn.Conv2d(dim, dim//2, 3, padding=1)  # Note: halves channels!
             )
+
         elif mode == 'upsample3d':
+            # Spatial: same as upsample2d
+            self.resample = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(dim, dim//2, 3, padding=1)
+            )
+            # Temporal: outputs 2x channels, then reshaped to 2x frames
             self.time_conv = CausalConv3d(dim, dim*2, (3,1,1), padding=(1,0,0))
-            # Doubles time by interleaving channels
 ```
+
+**How temporal upsampling works (upsample3d):**
+```python
+# In forward(), after time_conv outputs [B, C*2, T, H, W]:
+x = x.reshape(b, 2, c, t, h, w)              # Split channels into 2
+x = torch.stack((x[:, 0], x[:, 1]), dim=3)   # Interleave along time axis
+x = x.reshape(b, c, t * 2, h, w)             # Result: [B, C, T*2, H, W]
+```
+This is a **learned temporal upsample**: instead of interpolation, the conv predicts two frames per input frame.
+
+**How spatial ops work (all modes):**
+```python
+# Flatten time into batch, apply 2D conv, restore
+x = rearrange(x, 'b c t h w -> (b t) c h w')  # Each frame processed independently
+x = self.resample(x)
+x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
+```
+
+**Processing order:**
+- `upsample3d`: temporal first → then spatial
+- `downsample3d`: spatial first → then temporal
+
+**Why asymmetric padding `ZeroPad2d((0, 1, 0, 1))`?**
+
+The padding adds zeros only to the right and bottom edges:
+```
+nn.ZeroPad2d((left=0, right=1, top=0, bottom=1))
+nn.Conv2d(dim, dim, kernel=3, stride=2, padding=0)
+```
+
+Tracing through an 8×8 input:
+```
+Input: 8×8
+
+After ZeroPad2d(0,1,0,1) → 9×9:
+    ┌─────────────────┬─┐
+    │                 │0│
+    │                 │0│
+    │     pixels      │0│  ← zeros added to right
+    │                 │0│
+    │                 │0│
+    ├─────────────────┼─┤
+    │ 0 0 0 0 0 0 0 0 │0│  ← zeros added to bottom
+    └─────────────────┴─┘
+
+Then Conv2d(kernel=3, stride=2, padding=0):
+    Output: (9 - 3) / 2 + 1 = 4×4
+```
+
+Why not symmetric padding on all sides?
+
+1. **Alignment**: The first output pixel's 3×3 receptive field covers actual pixels `[0:3, 0:3]`, not padded zeros. The top-left corner stays anchored.
+
+2. **Matches upsampling**: When you upsample (nearest neighbor) then downsample, asymmetric padding ensures correct spatial alignment.
+
+3. **Handles odd dimensions**:
+   ```
+   7×7 → pad → 8×8 → stride 2 → 4×4
+   8×8 → pad → 9×9 → stride 2 → 4×4
+   ```
+   Both map to `ceil(H/2)` output size.
+
+Where the kernel lands with asymmetric padding (kernel=3, stride=2):
+```
+         col: 0   1   2   3   4   5   6   7   8
+            ┌───┬───┬───┬───┬───┬───┬───┬───┬───┐
+      row 0 │ A │ A │ * │ B │ * │ C │ * │ D │ 0 │
+      row 1 │ A │ A │ * │ B │ * │ C │ * │ D │ 0 │
+      row 2 │ * │ * │ * │ * │ * │ * │ * │ * │ 0 │  ← row 2 shared by kernels A,B,C,D and E,F,G,H
+      row 3 │ E │ E │ * │ F │ * │ G │ * │ H │ 0 │
+      row 4 │ E │ E │ * │ F │ * │ G │ * │ H │ 0 │
+      row 5 │ * │ * │ * │ * │ * │ * │ * │ * │ 0 │
+      row 6 │ I │ I │ * │ J │ * │ K │ * │ L │ 0 │
+      row 7 │ I │ I │ * │ J │ * │ K │ * │ L │ 0 │
+      row 8 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │  ← padded zeros
+            └───┴───┴───┴───┴───┴───┴───┴───┴───┘
+
+   * = overlap between adjacent kernels
+
+Kernel A: rows 0-2, cols 0-2 → output[0,0]
+Kernel B: rows 0-2, cols 2-4 → output[0,1]  (overlaps A at col 2)
+Kernel C: rows 0-2, cols 4-6 → output[0,2]  (overlaps B at col 4)
+Kernel D: rows 0-2, cols 6-8 → output[0,3]  (overlaps C at col 6)
+...
+Output: 4×4 from 9×9 padded input (originally 8×8)
+```
+
+With stride=2 and kernel=3, consecutive kernels **overlap by 1 pixel**.
+The kernel starts at actual pixel [0,0], not at a padded zero.
+
+**The `time_conv` - Temporal Convolution**
+
+The `time_conv` handles temporal dimension changes. Its kernel shape is `(3, 1, 1)`:
+```
+Temporal: 3 frames  ← looks at 3 consecutive frames
+Height:   1 pixel   ← no spatial mixing
+Width:    1 pixel   ← no spatial mixing
+```
+This is a **purely temporal convolution** - it mixes information across time only, applied independently at each spatial location.
+
+**For downsample3d** - halves temporal dimension:
+```python
+self.time_conv = CausalConv3d(dim, dim, (3,1,1), stride=(2,1,1), padding=(0,0,0))
+```
+```
+Input frames:   [0] [1] [2] [3] [4] [5] [6] [7]
+                 \_____/     \_____/     \_____/
+Kernel covers 3,   ↓           ↓           ↓      stride=2
+Output frames:    [0]         [1]         [2]     → T/2 frames
+```
+
+**For upsample3d** - doubles temporal dimension:
+```python
+self.time_conv = CausalConv3d(dim, dim*2, (3,1,1), padding=(1,0,0))
+```
+
+**Tracing the upsample padding:**
+```
+padding=(1, 0, 0) means pad_t=1, pad_h=0, pad_w=0
+
+CausalConv3d converts this to:
+  _padding = (0, 0,      # Width:  no padding
+              0, 0,      # Height: no padding
+              2*1, 0)    # Time:   2 past, 0 future  ← causal!
+
+With kernel=3 and 2 frames of past padding:
+
+  Input:    [frame0] [frame1] [frame2]
+              ↓
+  Padded:   [0] [0] [frame0] [frame1] [frame2]
+             ↑   ↑
+           zero padding (past only)
+
+  Kernel positions (size 3, stride 1):
+    Output 0: kernel sees [  0  ] [  0  ] [frame0] → outputs [0a, 0b]
+    Output 1: kernel sees [  0  ] [frame0] [frame1] → outputs [1a, 1b]
+    Output 2: kernel sees [frame0] [frame1] [frame2] → outputs [2a, 2b]
+```
+Each output only sees current + past frames, never future frames.
+
+Outputs 2x channels, then reshaped to 2x frames:
+```python
+# After time_conv: [B, C*2, T, H, W]
+x = x.reshape(b, 2, c, t, h, w)            # split channels into 2
+x = torch.stack((x[:,0], x[:,1]), dim=3)   # interleave along time
+x = x.reshape(b, c, t*2, h, w)             # now T*2 frames
+```
+```
+Input frames:     [0]     [1]     [2]
+                   ↓       ↓       ↓
+Conv outputs:   [0a,0b] [1a,1b] [2a,2b]   ← 2 channels per frame
+                   ↓  interleave  ↓
+Output frames:  [0a][0b][1a][1b][2a][2b]  → 2x frames
+```
+This is a **learned temporal upsample** - the network predicts two frames from each input frame.
+
+**Why "Causal" Conv?**
+
+Looking at CausalConv3d padding (line 24-25 of vae.py):
+```python
+self._padding = (pad_w, pad_w,      # Width:  symmetric
+                 pad_h, pad_h,      # Height: symmetric
+                 2 * pad_t, 0)      # Time:   ALL on past, none on future!
+```
+
+Normal conv with kernel=3, padding=1 (symmetric):
+```
+past | current | future
+ [1]     [2]      [3]    ← sees 1 past + 1 future frame
+```
+
+Causal conv with kernel=3, padding=1:
+```
+     past      | current
+ [1]    [2]       [3]    ← sees 2 past + 0 future frames
+```
+
+**Why causal matters:** For video generation/streaming, future frames don't exist yet. Causal convolutions ensure each output only depends on past and current inputs, enabling frame-by-frame streaming decode.
 
 ---
 
@@ -485,6 +687,63 @@ def decode(self, z, scale):
             out_ = self.decoder(x[:, :, i:i+1, :, :], ...)
             out = torch.cat([out, out_], dim=2)
     return out
+```
+
+**conv1 and conv2 - Latent Projections:**
+
+```python
+# Defined in __init__:
+self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)  # kernel=1 (pointwise)
+self.conv2 = CausalConv3d(z_dim, z_dim, 1)          # kernel=1 (pointwise)
+```
+
+These are **1x1x1 convolutions** - pointwise linear transforms with no spatial/temporal mixing:
+- `conv1`: Refines encoder output before splitting into μ and log_var
+- `conv2`: Refines latent before feeding to decoder
+
+Why 1x1x1 conv instead of Linear? Same math, but keeps tensor in [B,C,T,H,W] format.
+
+**Why different chunking: encode [1,4,4,4...] vs decode [1,1,1...]?**
+
+The temporal compression is 4x (two `downsample3d` with stride=2 each):
+```
+temporal_downsample = [False, True, True]  → 1x * 2x * 2x = 4x compression
+```
+
+**Encode processes [1, 4, 4, 4, ...] input frames:**
+```
+Input frames:    [0] [1  2  3  4] [5  6  7  8] ...
+                  ↓       ↓            ↓
+Latent frames:   [0]     [1]         [2]       ...
+
+- Frame 0 alone  → latent 0  (establishes causal cache, no past context)
+- Frames 1-4     → latent 1  (4 frames compress to 1 via 4x downsample)
+- Frames 5-8     → latent 2
+```
+
+**Decode processes [1, 1, 1, ...] latent frames:**
+```
+Latent frames:   [0]        [1]        [2]
+                  ↓          ↓          ↓
+Output frames:  [0 1 2 3]  [4 5 6 7]  [8 9 10 11]
+                4 frames   4 frames    4 frames
+
+temporal_upsample = [True, True, False]  → 2x * 2x * 1x = 4x expansion
+```
+
+**Key insight:** Each single latent frame "contains" ~4 video frames worth of information. The encoder compresses 4→1, the decoder expands 1→4.
+
+Decoding one latent at a time enables:
+1. **Streaming:** Output frames immediately, don't wait for all latents
+2. **Memory efficiency:** Minimal data in GPU memory at once
+3. **Causal coherence:** `feat_cache` maintains temporal context between chunks
+
+```
+ENCODE                              DECODE
+[B,3,17,H,W]  →  [1,4,4,4] chunks   [B,16,5,h,w]  →  [1,1,1,1,1] chunks  →  [B,3,17,H,W]
+                 ↓                                   ↓
+              4x compress                         4x expand
+              with caching                        with caching
 ```
 
 ### 5.4 WanVAE.tiled_encode
