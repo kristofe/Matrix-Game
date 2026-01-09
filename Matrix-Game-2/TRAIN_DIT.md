@@ -107,11 +107,32 @@ vae.eval()
 vae.requires_grad_(False)  # CRITICAL: VAE is always frozen during DiT training
 ```
 
-**Key VAE Properties:**
+**Key VAE Properties (SimpleVideoVAE):**
 - Input: `[B, 3, T, H, W]` video in `[-1, 1]`
-- Output: `[B, 16, T', H/8, W/8]` latents where `T' = 1 + (T-1)//4`
+- Output: `[B, 16, T/4, H/8, W/8]` latents
 - Spatial compression: 8×
-- Temporal compression: 4×
+- Temporal compression: 4× (via two strided temporal convolutions)
+
+**Important: SimpleVideoVAE vs StreamableVideoVAE vs Full WAN VAE**
+
+| Property | SimpleVideoVAE | StreamableVideoVAE | Full WAN VAE |
+|----------|----------------|-------------------|--------------|
+| Temporal formula | `T_latent = T_video // 4` | `T_latent = 1 + (T_video - 1) // 4` | Same as Streamable |
+| Valid T_video | Multiples of 4 (4, 8, 12...) | 1 + 4k (1, 5, 9, 13, 17...) | Same as Streamable |
+| Processing | Single forward pass | Chunked (1, then groups of 4) | Same as Streamable |
+| Streaming support | No | Yes | Yes |
+| Feature caching | No | Yes | Yes |
+
+**See VAE_DOC.md Appendix D for the complete StreamableVideoVAE implementation.**
+
+If you trained your **SimpleVideoVAE on 4 frames**, each training sample produces **1 latent frame**.
+If you trained your **StreamableVideoVAE on 5 frames**, each training sample produces **2 latent frames**.
+
+```
+Example with T_video=4:
+  Video:  [B, 3, 4, H, W]
+  Latent: [B, 16, 1, H/8, W/8]  ← Single latent frame per 4 video frames
+```
 
 ### 2.2 Training Data Format
 
@@ -128,20 +149,59 @@ data/
 │   └── ...
 ```
 
-**Video requirements:**
+**Video requirements for SimpleVideoVAE:**
 - Resolution divisible by 8 (e.g., 352×640, 720×1280)
-- Frame count: `T = 1 + 4k` for perfect VAE round-trip (e.g., 9, 17, 33 frames)
+- Frame count: **multiples of 4** (4, 8, 12, 16, 20...) for SimpleVideoVAE
 - RGB images normalized to `[-1, 1]`
+
+**Recommended training configurations:**
+
+| Video Frames | Latent Frames | Use Case |
+|--------------|---------------|----------|
+| 4 | 1 | Minimal (matches your VAE training) |
+| 8 | 2 | Short sequences |
+| 12 | 3 | Medium sequences |
+| 16 | 4 | Longer sequences |
 
 ### 2.3 Hardware Requirements
 
-| Setup | VRAM | Batch Size | Latent Frames |
-|-------|------|------------|---------------|
-| RTX 4090 (24GB) | 24 GB | 1 | 3 (9 video frames) |
-| A100 (40GB) | 40 GB | 2 | 6 (21 video frames) |
-| A100 (80GB) | 80 GB | 4 | 9 (33 video frames) |
+| Setup | VRAM | Batch Size | Latent Frames | Video Frames |
+|-------|------|------------|---------------|--------------|
+| RTX 4090 (24GB) | 24 GB | 1 | 1 | 4 |
+| RTX 4090 (24GB) | 24 GB | 1 | 2 | 8 |
+| A100 (40GB) | 40 GB | 2 | 2 | 8 |
+| A100 (80GB) | 80 GB | 4 | 4 | 16 |
 
 With gradient checkpointing, you can roughly double these numbers.
+
+**Note:** For SimpleVideoVAE, `video_frames = latent_frames × 4`.
+
+### 2.4 Training with Single Latent Frames
+
+If you trained your VAE on **4 video frames** (producing **1 latent frame**), you have options for DiT training:
+
+**Option A: Train with T_latent=1 (matches VAE training)**
+- Pros: Consistent with how VAE was trained
+- Cons: DiT sees no temporal context, learns single-frame prediction only
+- Good for: Initial experiments, testing the pipeline
+
+**Option B: Train with T_latent=2+ (longer sequences)**
+- Pros: DiT learns temporal dynamics across latent frames
+- Cons: VAE sees longer sequences than it was trained on
+- Good for: Production models, learning motion
+
+```
+Option A (T_latent=1):
+  Video: [B, 3, 4, H, W] → VAE → Latent: [B, 16, 1, H/8, W/8]
+  DiT predicts a single latent frame. No temporal attention across latents.
+
+Option B (T_latent=2):
+  Video: [B, 3, 8, H, W] → VAE → Latent: [B, 16, 2, H/8, W/8]
+  DiT can learn temporal relationships between 2 latent frames.
+  VAE generalizes to longer sequences (usually works well).
+```
+
+**Recommendation:** Start with T_latent=1 to verify training works, then increase to T_latent=2-4 for learning motion.
 
 ---
 
@@ -169,13 +229,14 @@ class VideoDataset(Dataset):
         └── Run_002/
             └── ...
     """
-    def __init__(self, data_root, num_latent_frames=3, image_size=(352, 640)):
+    def __init__(self, data_root, num_latent_frames=1, image_size=(352, 640)):
         self.data_root = Path(data_root)
         self.image_size = image_size  # (H, W)
 
         # Calculate video frames from latent frames
-        # VAE has 4× temporal compression
-        self.num_video_frames = 1 + 4 * (num_latent_frames - 1)
+        # SimpleVideoVAE has 4× temporal compression: T_latent = T_video // 4
+        # So T_video = T_latent * 4
+        self.num_video_frames = num_latent_frames * 4
 
         # Find all runs
         self.runs = sorted([d for d in self.data_root.iterdir() if d.is_dir()])
@@ -619,7 +680,7 @@ def train(
     batch_size: int = 1,
     learning_rate: float = 5e-6,
     grad_accum_steps: int = 4,
-    num_latent_frames: int = 3,
+    num_latent_frames: int = 1,  # 1 latent frame = 4 video frames (SimpleVideoVAE)
     image_size: tuple = (352, 640),
     checkpoint_every: int = 10,
     device: str = "cuda",
@@ -734,7 +795,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
-    parser.add_argument("--num_latent_frames", type=int, default=3)
+    parser.add_argument("--num_latent_frames", type=int, default=1, help="1 latent = 4 video frames")
     parser.add_argument("--device", type=str, default="cuda")
 
     args = parser.parse_args()
@@ -1010,7 +1071,7 @@ def generate_video(
     dit,
     vae,
     first_frame,
-    num_frames=17,
+    num_latent_frames=4,
     num_steps=3,
     device="cuda",
 ):
@@ -1021,21 +1082,21 @@ def generate_video(
         dit: Trained SimpleDiT
         vae: Trained SimpleVideoVAE (frozen)
         first_frame: [1, 3, H, W] in [-1, 1]
-        num_frames: Number of output frames
+        num_latent_frames: Number of latent frames to generate (output = 4× this)
         num_steps: Denoising steps (default 3 for flow matching)
 
     Returns:
-        video: [1, 3, T, H, W] generated video
+        video: [1, 3, T, H, W] generated video where T = num_latent_frames * 4
     """
     dit.eval()
     vae.eval()
 
-    # Encode first frame
-    first_frame_5d = first_frame.unsqueeze(2)  # [1, 3, 1, H, W]
-    first_latent, _ = vae.encode(first_frame_5d)  # [1, 16, 1, H', W']
+    # For SimpleVideoVAE, we need 4 frames to produce 1 latent frame
+    # To encode the first frame, we repeat it 4 times
+    first_frame_4 = first_frame.unsqueeze(2).expand(-1, -1, 4, -1, -1)  # [1, 3, 4, H, W]
+    first_latent, _ = vae.encode(first_frame_4)  # [1, 16, 1, H', W']
 
-    # Determine latent shape
-    num_latent_frames = 1 + (num_frames - 1) // 4
+    # Get latent dimensions
     _, C, _, H_lat, W_lat = first_latent.shape
 
     # Initialize with pure noise
@@ -1104,10 +1165,12 @@ first_frame = Image.open("frame_0000.png").convert('RGB')
 first_frame = torch.tensor(np.array(first_frame)).permute(2, 0, 1).float() / 127.5 - 1
 first_frame = first_frame.unsqueeze(0).cuda()  # [1, 3, H, W]
 
-# Generate
-video = generate_video(dit, vae, first_frame, num_frames=17, num_steps=3)
+# Generate video
+# num_latent_frames=4 → output 16 video frames (4 latent × 4 = 16 video frames)
+video = generate_video(dit, vae, first_frame, num_latent_frames=4, num_steps=3)
 
 # Save frames
+print(f"Generated {video.shape[2]} frames")  # 16 frames
 for i in range(video.shape[2]):
     frame = video[0, :, i, :, :]  # [3, H, W]
     frame = ((frame + 1) * 127.5).clamp(0, 255).byte()
@@ -1122,29 +1185,39 @@ for i in range(video.shape[2]):
 ### Tensor Shapes
 
 ```
-TRAINING:
-─────────
-Input video:        [B, 3, T, H, W]           e.g., [2, 3, 17, 352, 640]
-VAE latent:         [B, 16, T', H/8, W/8]     e.g., [2, 16, 5, 44, 80]
-Conditioning:       [B, 20, T', H/8, W/8]     e.g., [2, 20, 5, 44, 80]
-DiT input:          [B, 36, T', H/8, W/8]     e.g., [2, 36, 5, 44, 80]
-After patch embed:  [B, L, 1536]              e.g., [2, 8800, 1536]  (5×44×40)
+TRAINING (SimpleVideoVAE with 4-frame input):
+─────────────────────────────────────────────
+Input video:        [B, 3, T, H, W]           e.g., [2, 3, 4, 352, 640]
+VAE latent:         [B, 16, T/4, H/8, W/8]    e.g., [2, 16, 1, 44, 80]
+Conditioning:       [B, 20, T/4, H/8, W/8]    e.g., [2, 20, 1, 44, 80]
+DiT input:          [B, 36, T/4, H/8, W/8]    e.g., [2, 36, 1, 44, 80]
+After patch embed:  [B, L, 1536]              e.g., [2, 1760, 1536]  (1×44×40)
 Visual context:     [B, 257, 1536]            e.g., [2, 257, 1536]
 Timestep:           [B]                        e.g., [2]
-DiT output:         [B, 16, T', H/8, W/8]     e.g., [2, 16, 5, 44, 80]
+DiT output:         [B, 16, T/4, H/8, W/8]    e.g., [2, 16, 1, 44, 80]
+
+TRAINING (SimpleVideoVAE with 8-frame input):
+─────────────────────────────────────────────
+Input video:        [B, 3, 8, H, W]           e.g., [2, 3, 8, 352, 640]
+VAE latent:         [B, 16, 2, H/8, W/8]      e.g., [2, 16, 2, 44, 80]
+After patch embed:  [B, L, 1536]              e.g., [2, 3520, 1536]  (2×44×40)
 
 INFERENCE:
 ──────────
 First frame:        [1, 3, H, W]              e.g., [1, 3, 352, 640]
-Generated video:    [1, 3, T, H, W]           e.g., [1, 3, 17, 352, 640]
+Generated video:    [1, 3, T, H, W]           e.g., [1, 3, 16, 352, 640]
 ```
 
 ### Key Formulas
 
 ```
-VAE Temporal Compression:
-  T_latent = 1 + (T_video - 1) // 4
-  T_video = 1 + 4 * (T_latent - 1)
+VAE Temporal Compression (SimpleVideoVAE):
+  T_latent = T_video // 4
+  T_video = T_latent * 4
+
+  NOTE: Different from full WAN VAE which uses:
+    T_latent = 1 + (T_video - 1) // 4
+    T_video = 1 + 4 * (T_latent - 1)
 
 Flow Matching Forward:
   x_t = (1 - σ_t) * x_0 + σ_t * ε      where ε ~ N(0,1)
@@ -1175,7 +1248,8 @@ Loss:
 | **Diffusion** | num_steps | 3 | 3-10 |
 | | shift | 5.0 | 1.0-10.0 |
 | **Data** | image_size | (352, 640) | divisible by 8 |
-| | num_latent_frames | 3 | 3-15 |
+| | num_latent_frames | 1 | 1-4 (SimpleVideoVAE) |
+| | num_video_frames | 4 | 4, 8, 12, 16... |
 
 ---
 
